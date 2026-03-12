@@ -652,15 +652,20 @@ struct MessageRow: View, Equatable {
 
     var body: some View {
         let text = displayText
-        let renderModel = MessageRowRenderModelCache.model(for: message, displayText: text)
         switch message.role {
         case .user:
             userBubble(text: text)
         case .assistant:
-            assistantView(text: text, renderModel: renderModel)
+            assistantView(
+                text: text,
+                renderModel: MessageRowRenderModelCache.model(for: message, displayText: text)
+            )
         case .system:
             VStack(alignment: .leading, spacing: 8) {
-                systemView(text: text, renderModel: renderModel)
+                systemView(
+                    text: text,
+                    renderModel: MessageRowRenderModelCache.model(for: message, displayText: text)
+                )
                 if let blockText = copyBlockText {
                     CopyBlockButton(text: blockText)
                 }

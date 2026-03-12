@@ -211,9 +211,21 @@ extension CodexThread {
         return nil
     }
 
-    // Supports both seconds and milliseconds timestamps.
+    // Accept seconds, milliseconds, microseconds, and nanoseconds timestamps.
     private static func decodeUnixTimestamp(_ rawValue: Double) -> Date {
-        let secondsValue = rawValue > 10_000_000_000 ? rawValue / 1000 : rawValue
+        let magnitude = abs(rawValue)
+        let secondsValue: Double
+
+        if magnitude >= 1_000_000_000_000_000_000 {
+            secondsValue = rawValue / 1_000_000_000
+        } else if magnitude >= 1_000_000_000_000_000 {
+            secondsValue = rawValue / 1_000_000
+        } else if magnitude >= 10_000_000_000 {
+            secondsValue = rawValue / 1_000
+        } else {
+            secondsValue = rawValue
+        }
+
         return Date(timeIntervalSince1970: secondsValue)
     }
 

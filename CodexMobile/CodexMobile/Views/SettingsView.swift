@@ -382,6 +382,19 @@ private struct SettingsNotificationsCard: View {
                     }
                 }
             }
+
+            if canSendTestNotification {
+                SettingsButton("Send test notification") {
+                    HapticFeedback.shared.triggerImpactFeedback()
+                    Task {
+                        await codex.sendTestNotification()
+                    }
+                }
+
+                Text("The test alert appears immediately, even while this screen stays open.")
+                    .font(AppFont.caption())
+                    .foregroundStyle(.secondary)
+            }
         }
         .task {
             await codex.refreshNotificationAuthorizationStatus()
@@ -404,6 +417,17 @@ private struct SettingsNotificationsCard: View {
         case .ephemeral: "Ephemeral"
         case .notDetermined: "Not requested"
         @unknown default: "Unknown"
+        }
+    }
+
+    private var canSendTestNotification: Bool {
+        switch codex.notificationAuthorizationStatus {
+        case .authorized, .provisional, .ephemeral:
+            true
+        case .denied, .notDetermined:
+            false
+        @unknown default:
+            false
         }
     }
 }

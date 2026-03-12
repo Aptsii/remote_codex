@@ -9,6 +9,7 @@ import UserNotifications
 
 private enum CodexNotificationSource {
     static let runCompletion = "codex.runCompletion"
+    static let testProbe = "codex.testProbe"
 }
 
 protocol CodexUserNotificationCentering: AnyObject {
@@ -36,8 +37,13 @@ final class CodexNotificationCenterDelegateProxy: NSObject, UNUserNotificationCe
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
+        if let source = notification.request.content.userInfo[CodexNotificationPayloadKeys.source] as? String,
+           source == CodexNotificationSource.testProbe {
+            return [.banner, .sound]
+        }
+
         // The in-app timeline and run badges already explain the new state.
-        []
+        return []
     }
 
     func userNotificationCenter(
@@ -117,6 +123,33 @@ extension CodexService {
 
     func refreshNotificationAuthorizationStatus() async {
         notificationAuthorizationStatus = await userNotificationCenter.authorizationStatus()
+    }
+
+    func sendTestNotification() async {
+        await refreshNotificationAuthorizationStatus()
+        guard canScheduleRunCompletionNotifications else {
+            return
+        }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Remodex Test"
+        content.body = "Notifications are working on this iPhone."
+        content.sound = .default
+        content.userInfo = [
+            CodexNotificationPayloadKeys.source: CodexNotificationSource.testProbe,
+        ]
+
+        let request = UNNotificationRequest(
+            identifier: "codex.testProbe.\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+
+        do {
+            try await userNotificationCenter.add(request)
+        } catch {
+            debugRuntimeLog("failed to schedule test notification: \(error.localizedDescription)")
+        }
     }
 
     // Schedules a local alert only when a run finishes while the app is away from the foreground.

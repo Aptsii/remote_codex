@@ -424,6 +424,7 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertFalse(service.isInitialized)
         XCTAssertNil(service.lastErrorMessage)
         XCTAssertTrue(service.shouldAutoReconnectOnForeground)
+        XCTAssertEqual(service.connectionRecoveryState, .idle)
     }
 
     func testForegroundConnectionAbortArmsReconnect() {

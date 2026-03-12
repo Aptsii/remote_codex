@@ -9,6 +9,27 @@
 
 import Foundation
 
+struct SampledTextFingerprint: Hashable {
+    let utf8Count: Int
+    let prefixHash: Int
+    let suffixHash: Int
+
+    var cacheKey: String {
+        "\(utf8Count):\(prefixHash):\(suffixHash)"
+    }
+
+    static func make(_ text: String, sampleBytes: Int = 48) -> SampledTextFingerprint {
+        let utf8 = text.utf8
+        let prefix = String(decoding: utf8.prefix(sampleBytes), as: UTF8.self)
+        let suffix = String(decoding: utf8.suffix(sampleBytes), as: UTF8.self)
+        return SampledTextFingerprint(
+            utf8Count: utf8.count,
+            prefixHash: prefix.hashValue,
+            suffixHash: suffix.hashValue
+        )
+    }
+}
+
 enum MarkdownRenderableTextCache {
     static let maxEntries = 512
     static let lock = NSLock()
@@ -20,7 +41,7 @@ enum MarkdownRenderableTextCache {
         profile: MarkdownRenderProfile,
         builder: () -> String
     ) -> String {
-        let cacheKey = "\(profile.cacheKey)|\(raw.hashValue)"
+        let cacheKey = "\(profile.cacheKey)|\(SampledTextFingerprint.make(raw).cacheKey)"
 
         lock.lock()
         if let cached = renderedByKey[cacheKey] {
@@ -73,7 +94,7 @@ enum MessageRowRenderModelCache {
 
     // Bundles all row-level parsing into one cache hit so timeline cells avoid repeated parser churn.
     static func model(for message: CodexMessage, displayText: String) -> MessageRowRenderModel {
-        let key = "\(message.id)|\(message.kind.rawValue)|\(message.role.rawValue)|\(displayText.hashValue)"
+        let key = "\(message.id)|\(message.kind.rawValue)|\(message.role.rawValue)|\(SampledTextFingerprint.make(displayText).cacheKey)"
 
         lock.lock()
         if let cached = cache[key] {
@@ -158,7 +179,7 @@ enum CommandExecutionStatusCache {
     static var statusByKey: [String: CommandExecutionStatusModel] = [:]
 
     static func status(messageID: String, text: String) -> CommandExecutionStatusModel? {
-        let cacheKey = "\(messageID)|\(text.hashValue)"
+        let cacheKey = "\(messageID)|\(SampledTextFingerprint.make(text).cacheKey)"
 
         lock.lock()
         if let cached = statusByKey[cacheKey] {
@@ -207,7 +228,7 @@ enum FileChangeSystemRenderCache {
 
     // Caches file-change parse artifacts to keep scrolling smooth on long patch threads.
     static func renderState(messageID: String, sourceText: String) -> FileChangeRenderState {
-        let cacheKey = "\(messageID)|\(sourceText.hashValue)"
+        let cacheKey = "\(messageID)|\(SampledTextFingerprint.make(sourceText).cacheKey)"
 
         lock.lock()
         if let cached = stateByKey[cacheKey] {
@@ -403,7 +424,7 @@ enum PerFileDiffChunkCache {
     static var cache: [String: [PerFileDiffChunk]] = [:]
 
     static func chunks(messageID: String, bodyText: String, entries: [TurnFileChangeSummaryEntry]) -> [PerFileDiffChunk] {
-        let key = "\(messageID)|\(bodyText.hashValue)"
+        let key = "\(messageID)|\(SampledTextFingerprint.make(bodyText).cacheKey)"
 
         lock.lock()
         if let cached = cache[key] {
@@ -433,7 +454,7 @@ enum CodeCommentDirectiveContentCache {
     static var cache: [String: CodeCommentDirectiveContent] = [:]
 
     static func content(messageID: String, text: String) -> CodeCommentDirectiveContent {
-        let key = "\(messageID)|\(text.hashValue)"
+        let key = "\(messageID)|\(SampledTextFingerprint.make(text).cacheKey)"
 
         lock.lock()
         if let cached = cache[key] {
@@ -463,7 +484,7 @@ enum ThinkingDisclosureContentCache {
     static var cache: [String: ThinkingDisclosureContent] = [:]
 
     static func content(messageID: String, text: String) -> ThinkingDisclosureContent {
-        let key = "\(messageID)|\(text.hashValue)"
+        let key = "\(messageID)|\(SampledTextFingerprint.make(text).cacheKey)"
 
         lock.lock()
         if let cached = cache[key] {

@@ -36,7 +36,7 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
     private let scrollBottomAnchorID = "turn-scroll-bottom-anchor"
     /// Number of messages to show per page.  Only the tail slice is rendered;
     /// scrolling to the top reveals a "Load earlier messages" button.
-    private static var pageSize: Int { 40 }
+    private static var pageSize: Int { 24 }
 
     @State private var visibleTailCount: Int = pageSize
     @State private var viewportHeight: CGFloat = 0
@@ -50,6 +50,8 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
     @State private var initialRecoverySnapPendingThreadID: String?
     @State private var initialRecoverySnapTask: Task<Void, Never>?
     @State private var followBottomScrollTask: Task<Void, Never>?
+    @State private var geometryUpdateTask: Task<Void, Never>?
+    @State private var timelineMutationTask: Task<Void, Never>?
     @State private var isUserDraggingScroll = false
     @State private var userScrollCooldownUntil: Date?
 
@@ -162,20 +164,13 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
                             >= geometry.contentSize.height - TurnScrollStateTracker.bottomThreshold
                     }
                     return ScrollBottomGeometry(isAtBottom: isAtBottom, viewportHeight: vh)
-                } action: { old, new in
-                    if new.viewportHeight != old.viewportHeight, new.viewportHeight > 0 {
-                        viewportHeight = new.viewportHeight
-                        performInitialRecoverySnapIfNeeded(using: proxy)
-                    }
-                    if new.isAtBottom != old.isAtBottom {
-                        handleScrolledToBottomChanged(new.isAtBottom)
-                    }
+                } action: { _, new in
+                    scheduleGeometryUpdate(new, using: proxy)
                 }
                 // React to every timeline mutation so streamed text growth stays pinned
                 // when the user is already at the bottom.
                 .onChange(of: timelineChangeToken) { _, _ in
-                    recomputeBlockInfoIfNeeded()
-                    handleTimelineMutation(using: proxy)
+                    scheduleTimelineMutation(using: proxy, recomputeBlockInfo: true)
                 }
                 .onChange(of: isThreadRunning) { _, _ in
                     recomputeBlockInfoIfNeeded()
@@ -268,7 +263,8 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
             hasher.combine(message.kind)
             hasher.combine(message.turnId)
             hasher.combine(message.isStreaming)
-            hasher.combine(message.text)
+            let fingerprint = SampledTextFingerprint.make(message.text)
+            hasher.combine(fingerprint)
         }
 
         return hasher.finalize()
@@ -359,6 +355,51 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
         initialRecoverySnapTask = nil
         followBottomScrollTask?.cancel()
         followBottomScrollTask = nil
+        geometryUpdateTask?.cancel()
+        geometryUpdateTask = nil
+        timelineMutationTask?.cancel()
+        timelineMutationTask = nil
+    }
+
+    // Coalesces geometry-driven state writes so ScrollView layout does not
+    // bounce multiple @State updates within the same frame.
+    private func scheduleGeometryUpdate(_ geometry: ScrollBottomGeometry, using proxy: ScrollViewProxy) {
+        geometryUpdateTask?.cancel()
+        let expectedThreadID = threadID
+        geometryUpdateTask = Task { @MainActor in
+            defer { geometryUpdateTask = nil }
+            await Task.yield()
+            guard !Task.isCancelled, scrollSessionThreadID == nil || scrollSessionThreadID == expectedThreadID else {
+                return
+            }
+
+            if geometry.viewportHeight > 0, geometry.viewportHeight != viewportHeight {
+                viewportHeight = geometry.viewportHeight
+                performInitialRecoverySnapIfNeeded(using: proxy)
+            }
+
+            if geometry.isAtBottom != isScrolledToBottom {
+                handleScrolledToBottomChanged(geometry.isAtBottom)
+            }
+        }
+    }
+
+    // Collapses repeated timeline mutations that land inside one display frame.
+    private func scheduleTimelineMutation(using proxy: ScrollViewProxy, recomputeBlockInfo: Bool) {
+        timelineMutationTask?.cancel()
+        let expectedThreadID = threadID
+        timelineMutationTask = Task { @MainActor in
+            defer { timelineMutationTask = nil }
+            await Task.yield()
+            guard !Task.isCancelled, scrollSessionThreadID == nil || scrollSessionThreadID == expectedThreadID else {
+                return
+            }
+
+            if recomputeBlockInfo {
+                recomputeBlockInfoIfNeeded()
+            }
+            handleTimelineMutation(using: proxy)
+        }
     }
 
     // Stops follow-bottom as soon as the user drags away so queued snaps cannot fight the gesture.

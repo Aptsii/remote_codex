@@ -1780,6 +1780,7 @@ extension CodexService {
             for: threadId,
             projectedMessages: projectedMessages,
             workingDirectory: gitWorkingDirectory(for: threadId),
+            isThreadRunning: isThreadRunning,
             messageRevision: revision,
             revertStateRevision: assistantRevertStateRevision
         )
@@ -1861,13 +1862,14 @@ extension CodexService {
         for threadId: String,
         projectedMessages: [CodexMessage],
         workingDirectory: String?,
+        isThreadRunning: Bool,
         messageRevision: Int,
         revertStateRevision: Int
     ) -> [String: AssistantRevertPresentation] {
         if let cached = assistantRevertStateCacheByThread[threadId],
-           cached.messageRevision == messageRevision,
            cached.busyRepoRevision == busyRepoRootsRevision,
-           cached.revertStateRevision == revertStateRevision {
+           cached.revertStateRevision == revertStateRevision,
+           (cached.messageRevision == messageRevision || isThreadRunning) {
             return cached.statesByMessageID
         }
 

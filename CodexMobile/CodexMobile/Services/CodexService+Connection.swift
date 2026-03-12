@@ -222,7 +222,9 @@ extension CodexService {
         postConnectSyncToken = nil
         isBootstrappingConnectionSync = false
         if shouldAttemptAutoRecovery {
-            connectionRecoveryState = .retrying(attempt: 0, message: recoveryStatusMessage(for: error))
+            connectionRecoveryState = shouldSuppressMessage
+                ? .idle
+                : .retrying(attempt: 0, message: recoveryStatusMessage(for: error))
             lastErrorMessage = nil
         } else {
             connectionRecoveryState = .idle

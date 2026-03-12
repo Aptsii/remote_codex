@@ -5,6 +5,7 @@
 // Depends on: child_process, ws
 
 const { spawn } = require("child_process");
+const { StringDecoder } = require("string_decoder");
 const WebSocket = require("ws");
 
 function createCodexTransport({ endpoint = "", env = process.env } = {}) {
@@ -24,12 +25,17 @@ function createSpawnTransport({ env }) {
   let didRequestShutdown = false;
   let didReportError = false;
   const listeners = createListenerBag();
+  const stdoutDecoder = new StringDecoder("utf8");
+  const stderrDecoder = new StringDecoder("utf8");
 
   codex.on("error", (error) => {
     didReportError = true;
     listeners.emitError(error);
   });
   codex.on("close", (code, signal) => {
+    stderrBuffer = appendOutputBuffer(stderrBuffer, stderrDecoder.end());
+    flushStdoutBuffer(stdoutDecoder.end(), { emitRemainder: true });
+
     if (!didRequestShutdown && !didReportError && code !== 0) {
       didReportError = true;
       listeners.emitError(createCodexCloseError({
@@ -46,11 +52,15 @@ function createSpawnTransport({ env }) {
   // Keep stderr muted during normal operation, but preserve enough output to
   // explain launch failures when the child exits before the bridge can use it.
   codex.stderr.on("data", (chunk) => {
-    stderrBuffer = appendOutputBuffer(stderrBuffer, chunk.toString("utf8"));
+    stderrBuffer = appendOutputBuffer(stderrBuffer, stderrDecoder.write(chunk));
   });
 
   codex.stdout.on("data", (chunk) => {
-    stdoutBuffer += chunk.toString("utf8");
+    flushStdoutBuffer(stdoutDecoder.write(chunk));
+  });
+
+  function flushStdoutBuffer(fragment, { emitRemainder = false } = {}) {
+    stdoutBuffer += fragment;
     const lines = stdoutBuffer.split("\n");
     stdoutBuffer = lines.pop() || "";
 
@@ -60,7 +70,15 @@ function createSpawnTransport({ env }) {
         listeners.emitMessage(trimmedLine);
       }
     }
-  });
+
+    if (emitRemainder) {
+      const trailingLine = stdoutBuffer.trim();
+      if (trailingLine) {
+        listeners.emitMessage(trailingLine);
+      }
+      stdoutBuffer = "";
+    }
+  }
 
   return {
     mode: "spawn",

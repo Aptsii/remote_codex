@@ -15,6 +15,7 @@ const { DEFAULT_RELAY_FALLBACK_HOST } = require("./relay-config");
 const { startLocalRelayServer } = require("./local-relay-server");
 const { printQR } = require("./qr");
 const { rememberActiveThread } = require("./session-state");
+const { enrichThreadReadResponse } = require("./thread-read-enricher");
 const { createDesktopRequestHandler } = require("./desktop-handler");
 const { handleGitRequest } = require("./git-handler");
 const { handleWorkspaceRequest } = require("./workspace-handler");
@@ -44,6 +45,7 @@ function startBridge() {
   let lastConnectionStatus = null;
   let codexHandshakeState = config.codexEndpoint ? "warm" : "cold";
   const forwardedInitializeRequestIds = new Set();
+  const forwardedThreadReadRequestIds = new Set();
   let relayBaseUrl = "";
   let relaySessionUrl = "";
   let secureTransport = null;
@@ -180,10 +182,11 @@ function startBridge() {
     if (!secureTransport) {
       return;
     }
-    trackCodexHandshakeState(message);
-    desktopRefresher.handleOutbound(message);
-    rememberThreadFromMessage("codex", message);
-    secureTransport.queueOutboundApplicationMessage(message, (wireMessage) => {
+    const outboundMessage = maybeEnrichCodexResponse(message);
+    trackCodexHandshakeState(outboundMessage);
+    desktopRefresher.handleOutbound(outboundMessage);
+    rememberThreadFromMessage("codex", outboundMessage);
+    secureTransport.queueOutboundApplicationMessage(outboundMessage, (wireMessage) => {
       if (socket?.readyState === WebSocket.OPEN) {
         socket.send(wireMessage);
       }
@@ -228,6 +231,7 @@ function startBridge() {
     }
     desktopRefresher.handleInbound(rawMessage);
     rememberThreadFromMessage("phone", rawMessage);
+    trackForwardedCodexRequest(rawMessage);
     codex.send(rawMessage);
   }
 
@@ -319,6 +323,47 @@ function startBridge() {
     if (errorMessage.includes("already initialized")) {
       codexHandshakeState = "warm";
     }
+  }
+
+  function trackForwardedCodexRequest(rawMessage) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(rawMessage);
+    } catch {
+      return;
+    }
+
+    if (parsed?.id == null || parsed?.method !== "thread/read") {
+      return;
+    }
+
+    forwardedThreadReadRequestIds.add(String(parsed.id));
+  }
+
+  function maybeEnrichCodexResponse(rawMessage) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(rawMessage);
+    } catch {
+      return rawMessage;
+    }
+
+    if (parsed?.id == null) {
+      return rawMessage;
+    }
+
+    const responseKey = String(parsed.id);
+    if (!forwardedThreadReadRequestIds.has(responseKey)) {
+      return rawMessage;
+    }
+
+    forwardedThreadReadRequestIds.delete(responseKey);
+
+    if (parsed?.error != null) {
+      return rawMessage;
+    }
+
+    return enrichThreadReadResponse(rawMessage);
   }
 
   async function initializeRelay() {

@@ -37,6 +37,7 @@ extension CodexService {
         latestAssistantOutputByThread.removeValue(forKey: threadId)
         latestRepoAffectingMessageSignalByThread.removeValue(forKey: threadId)
         assistantRevertStateCacheByThread.removeValue(forKey: threadId)
+        pendingStreamingTimelineRefreshThreadIDs.remove(threadId)
     }
 
     // Clears every service-owned timeline cache during global teardown.
@@ -46,10 +47,34 @@ extension CodexService {
         latestAssistantOutputByThread.removeAll()
         latestRepoAffectingMessageSignalByThread.removeAll()
         assistantRevertStateCacheByThread.removeAll()
+        pendingStreamingTimelineRefreshThreadIDs.removeAll()
     }
 
     // Refreshes the derived output cache and bumps the thread timeline revision.
     func updateCurrentOutput(for threadId: String) {
+        pendingStreamingTimelineRefreshThreadIDs.remove(threadId)
+        applyOutputRefresh(for: threadId)
+    }
+
+    // Collapses rapid streaming deltas into at most one expensive snapshot rebuild per frame.
+    func scheduleStreamingTimelineRefresh(for threadId: String) {
+        guard pendingStreamingTimelineRefreshThreadIDs.insert(threadId).inserted else {
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 16_000_000)
+            guard let self,
+                  self.pendingStreamingTimelineRefreshThreadIDs.contains(threadId) else {
+                return
+            }
+
+            self.pendingStreamingTimelineRefreshThreadIDs.remove(threadId)
+            self.applyOutputRefresh(for: threadId)
+        }
+    }
+
+    private func applyOutputRefresh(for threadId: String) {
         noteMessagesChanged(for: threadId)
 
         let latestAssistantText = messagesByThread[threadId]?
@@ -488,7 +513,11 @@ extension CodexService {
                 threadMessages.sort(by: { $0.orderIndex < $1.orderIndex })
                 messagesByThread[threadId] = threadMessages
                 persistMessages()
-                updateCurrentOutput(for: threadId)
+                if isStreaming {
+                    scheduleStreamingTimelineRefresh(for: threadId)
+                } else {
+                    updateCurrentOutput(for: threadId)
+                }
                 return
             }
         }
@@ -1414,7 +1443,7 @@ extension CodexService {
         }
 
         persistMessages()
-        updateCurrentOutput(for: threadId)
+        scheduleStreamingTimelineRefresh(for: threadId)
     }
 
     // Finalizes assistant text when item/completed carries the canonical message body.

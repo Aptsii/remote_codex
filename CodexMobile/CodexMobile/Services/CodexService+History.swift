@@ -534,6 +534,9 @@ extension CodexService {
         if value.attachments.isEmpty && !serverMessage.attachments.isEmpty {
             value.attachments = serverMessage.attachments
         }
+        if serverMessage.role != .system {
+            value.createdAt = serverMessage.createdAt
+        }
 
         if value.role == .assistant {
             let serverText = normalizedMessageText(serverMessage.text)

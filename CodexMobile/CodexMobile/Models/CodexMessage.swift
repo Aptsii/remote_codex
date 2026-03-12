@@ -33,7 +33,7 @@ struct CodexMessage: Identifiable, Codable, Hashable, Sendable {
     let role: CodexMessageRole
     var kind: CodexMessageKind
     var text: String
-    let createdAt: Date
+    var createdAt: Date
     var turnId: String?
     var itemId: String?
     var isStreaming: Bool

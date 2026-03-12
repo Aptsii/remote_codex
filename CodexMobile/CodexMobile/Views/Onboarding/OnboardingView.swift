@@ -62,8 +62,9 @@ struct OnboardingView: View {
 
                                 OnboardingStepRow(
                                     number: "2",
-                                    title: "Start the relay",
-                                    command: "remodex up"
+                                    title: "Start Remodex on your Mac",
+                                    command: "remodex up",
+                                    subtitle: "This starts the local bridge and uses a local relay by default."
                                 )
 
                                 OnboardingStepRow(

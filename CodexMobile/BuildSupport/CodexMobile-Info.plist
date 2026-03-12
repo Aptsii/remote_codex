@@ -2,10 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>BGTaskSchedulerPermittedIdentifiers</key>
-	<array>
-		<string>com.emanueledipietro.CodexMobile.refresh</string>
-	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -22,19 +18,6 @@
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
-	<key>CFBundleURLTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleTypeRole</key>
-			<string>Editor</string>
-			<key>CFBundleURLName</key>
-			<string>com.emanueledipietro.CodexMobile.auth</string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>phodex</string>
-			</array>
-		</dict>
-	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
@@ -45,14 +28,6 @@
 	<string>CodexMobile needs local network access to connect to your Codex app-server running on your Mac.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>CodexMobile needs photo library access to let you attach images to your messages.</string>
-	<key>PHODEX_API_URL</key>
-	<string>$(PHODEX_API_URL)</string>
-	<key>PHODEX_CHATGPT_CALLBACK_SCHEME</key>
-	<string>$(PHODEX_CHATGPT_CALLBACK_SCHEME)</string>
-	<key>PHODEX_CHATGPT_CALLBACK_URL</key>
-	<string>$(PHODEX_CHATGPT_CALLBACK_URL)</string>
-	<key>PHODEX_DEFAULT_WS_URL</key>
-	<string>$(PHODEX_DEFAULT_WS_URL)</string>
 	<key>UIAppFonts</key>
 	<array>
 		<string>JetBrainsMono-Regular.ttf</string>
@@ -72,11 +47,6 @@
 	</dict>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>fetch</string>
-		<string>remote-notification</string>
-	</array>
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UILaunchScreen</key>

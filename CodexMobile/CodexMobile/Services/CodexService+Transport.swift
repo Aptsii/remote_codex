@@ -64,6 +64,15 @@ extension CodexService {
         try await sendMessage(notification)
     }
 
+    // Manually asks the paired Mac bridge to remount Codex.app for the current thread.
+    func refreshDesktopApp(threadId: String) async throws {
+        let normalizedThreadID = threadId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let params: JSONValue? = normalizedThreadID.isEmpty
+            ? nil
+            : .object(["threadId": .string(normalizedThreadID)])
+        _ = try await sendRequest(method: "desktop/refreshApp", params: params)
+    }
+
     // Sends an RPC response for a server-initiated request.
     func sendResponse(id: JSONValue, result: JSONValue) async throws {
         let response = RPCMessage(id: id, result: result, includeJSONRPC: false)

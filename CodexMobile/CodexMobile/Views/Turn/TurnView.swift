@@ -116,11 +116,13 @@ struct TurnView: View {
                 repoDiffTotals: viewModel.gitRepoSync?.repoDiffTotals,
                 isLoadingRepoDiff: isLoadingRepositoryDiff,
                 showsGitActions: showsGitControls,
+                showsDesktopRefreshButton: codex.isConnected,
                 isGitActionEnabled: canRunGitAction(
                     isThreadRunning: isThreadRunning,
                     gitWorkingDirectory: gitWorkingDirectory
                 ),
                 isRunningGitAction: viewModel.isRunningGitAction,
+                isRefreshingDesktopApp: viewModel.isRefreshingDesktopApp,
                 showsDiscardRuntimeChangesAndSync: viewModel.shouldShowDiscardRuntimeChangesAndSync,
                 gitSyncState: viewModel.gitSyncState,
                 contextWindowUsage: codex.contextWindowUsageByThread[thread.id],
@@ -133,6 +135,9 @@ struct TurnView: View {
                 },
                 onTapRepoDiff: showsGitControls ? {
                     presentRepositoryDiff(workingDirectory: gitWorkingDirectory)
+                } : nil,
+                onRefreshDesktopApp: codex.isConnected ? {
+                    viewModel.refreshDesktopApp(codex: codex, threadID: thread.id)
                 } : nil,
                 onGitAction: { action in
                     handleGitActionSelection(

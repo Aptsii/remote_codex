@@ -11,8 +11,11 @@ const {
   readBridgeConfig,
 } = require("./codex-desktop-refresher");
 const { createCodexTransport } = require("./codex-transport");
+const { DEFAULT_RELAY_FALLBACK_HOST } = require("./relay-config");
+const { startLocalRelayServer } = require("./local-relay-server");
 const { printQR } = require("./qr");
 const { rememberActiveThread } = require("./session-state");
+const { createDesktopRequestHandler } = require("./desktop-handler");
 const { handleGitRequest } = require("./git-handler");
 const { handleWorkspaceRequest } = require("./workspace-handler");
 const { loadOrCreateBridgeDeviceState } = require("./secure-device-state");
@@ -20,17 +23,18 @@ const { createBridgeSecureTransport } = require("./secure-transport");
 
 function startBridge() {
   const config = readBridgeConfig();
+  let relayServer = null;
   const sessionId = uuidv4();
-  const relayBaseUrl = config.relayUrl.replace(/\/+$/, "");
-  const relaySessionUrl = `${relayBaseUrl}/${sessionId}`;
   const deviceState = loadOrCreateBridgeDeviceState();
   const desktopRefresher = new CodexDesktopRefresher({
     enabled: config.refreshEnabled,
     debounceMs: config.refreshDebounceMs,
     refreshCommand: config.refreshCommand,
+    refreshMode: config.refreshMode,
     bundleId: config.codexBundleId,
     appPath: config.codexAppPath,
   });
+  const handleDesktopRequest = createDesktopRequestHandler({ desktopRefresher });
 
   // Keep the local Codex runtime alive across transient relay disconnects.
   let socket = null;
@@ -40,11 +44,9 @@ function startBridge() {
   let lastConnectionStatus = null;
   let codexHandshakeState = config.codexEndpoint ? "warm" : "cold";
   const forwardedInitializeRequestIds = new Set();
-  const secureTransport = createBridgeSecureTransport({
-    sessionId,
-    relayUrl: relayBaseUrl,
-    deviceState,
-  });
+  let relayBaseUrl = "";
+  let relaySessionUrl = "";
+  let secureTransport = null;
 
   const codex = createCodexTransport({
     endpoint: config.codexEndpoint,
@@ -53,6 +55,7 @@ function startBridge() {
   });
 
   codex.onError((error) => {
+    closeRelayServer();
     if (config.codexEndpoint) {
       console.error(`[remodex] Failed to connect to Codex endpoint: ${config.codexEndpoint}`);
     } else {
@@ -163,10 +166,20 @@ function startBridge() {
     });
   }
 
-  printQR(secureTransport.createPairingPayload());
-  connectRelay();
+  initializeRelay()
+    .then(() => {
+      printQR(secureTransport.createPairingPayload());
+      connectRelay();
+    })
+    .catch((error) => {
+      console.error(error.message);
+      process.exit(1);
+    });
 
   codex.onMessage((message) => {
+    if (!secureTransport) {
+      return;
+    }
     trackCodexHandshakeState(message);
     desktopRefresher.handleOutbound(message);
     rememberThreadFromMessage("codex", message);
@@ -181,6 +194,7 @@ function startBridge() {
     logConnectionStatus("disconnected");
     isShuttingDown = true;
     clearReconnectTimer();
+    closeRelayServer();
     desktopRefresher.handleTransportReset();
     if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) {
       socket.close();
@@ -190,15 +204,20 @@ function startBridge() {
   process.on("SIGINT", () => shutdown(codex, () => socket, () => {
     isShuttingDown = true;
     clearReconnectTimer();
+    closeRelayServer();
   }));
   process.on("SIGTERM", () => shutdown(codex, () => socket, () => {
     isShuttingDown = true;
     clearReconnectTimer();
+    closeRelayServer();
   }));
 
   // Routes decrypted app payloads through the same bridge handlers as before.
   function handleApplicationMessage(rawMessage) {
     if (handleBridgeManagedHandshakeMessage(rawMessage)) {
+      return;
+    }
+    if (handleDesktopRequest(rawMessage, sendApplicationResponse)) {
       return;
     }
     if (handleWorkspaceRequest(rawMessage, sendApplicationResponse)) {
@@ -300,6 +319,45 @@ function startBridge() {
     if (errorMessage.includes("already initialized")) {
       codexHandshakeState = "warm";
     }
+  }
+
+  async function initializeRelay() {
+    if (config.managedRelay) {
+      relayServer = await startLocalRelayServer({
+        bindHost: config.relayBindHost,
+        port: config.relayPort,
+        advertisedHost: config.relayAdvertiseHost,
+      });
+      relayBaseUrl = relayServer.relayUrl.replace(/\/+$/, "");
+      if (relayServer.reusedExisting) {
+        console.log(`[remodex] using existing local relay at ${relayBaseUrl}`);
+      } else {
+        console.log(`[remodex] local relay ready at ${relayBaseUrl}`);
+      }
+      if (config.relayAdvertiseHost === DEFAULT_RELAY_FALLBACK_HOST) {
+        console.log(
+          "[remodex] no LAN IP was detected; set REMODEX_RELAY_HOST to your Mac's reachable IP if the phone cannot connect."
+        );
+      }
+    } else {
+      relayBaseUrl = config.relayUrl.replace(/\/+$/, "");
+      console.log(`[remodex] relay endpoint ${relayBaseUrl}`);
+    }
+
+    relaySessionUrl = `${relayBaseUrl}/${sessionId}`;
+    secureTransport = createBridgeSecureTransport({
+      sessionId,
+      relayUrl: relayBaseUrl,
+      deviceState,
+    });
+  }
+
+  function closeRelayServer() {
+    if (!relayServer) {
+      return;
+    }
+    relayServer.close().catch(() => {});
+    relayServer = null;
   }
 }
 

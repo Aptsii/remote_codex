@@ -17,8 +17,10 @@ struct TurnToolbarContent: ToolbarContent {
     let repoDiffTotals: GitDiffTotals?
     let isLoadingRepoDiff: Bool
     let showsGitActions: Bool
+    let showsDesktopRefreshButton: Bool
     let isGitActionEnabled: Bool
     let isRunningGitAction: Bool
+    let isRefreshingDesktopApp: Bool
     let showsDiscardRuntimeChangesAndSync: Bool
     let gitSyncState: String?
     let contextWindowUsage: ContextWindowUsage?
@@ -26,6 +28,7 @@ struct TurnToolbarContent: ToolbarContent {
     var isCompacting: Bool = false
     var onCompactContext: (() -> Void)?
     var onTapRepoDiff: (() -> Void)?
+    var onRefreshDesktopApp: (() -> Void)?
     let onGitAction: (TurnGitActionKind) -> Void
 
     @Binding var isShowingPathSheet: Bool
@@ -75,6 +78,13 @@ struct TurnToolbarContent: ToolbarContent {
                     )
                 }
 
+                if showsDesktopRefreshButton, let onRefreshDesktopApp {
+                    TurnDesktopRefreshToolbarButton(
+                        isRefreshing: isRefreshingDesktopApp,
+                        onTap: onRefreshDesktopApp
+                    )
+                }
+
                 if showsGitActions {
                     TurnGitActionsToolbarButton(
                         isEnabled: isGitActionEnabled,
@@ -86,6 +96,35 @@ struct TurnToolbarContent: ToolbarContent {
                 }
             }
         }
+    }
+}
+
+private struct TurnDesktopRefreshToolbarButton: View {
+    let isRefreshing: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        Button {
+            HapticFeedback.shared.triggerImpactFeedback(style: .light)
+            onTap()
+        } label: {
+            Group {
+                if isRefreshing {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .frame(width: 28, height: 28)
+                } else {
+                    Image(systemName: "arrow.clockwise.circle")
+                        .font(.system(size: 17, weight: .semibold))
+                        .frame(width: 28, height: 28)
+                }
+            }
+            .contentShape(Circle())
+            .adaptiveToolbarItem(in: Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isRefreshing)
+        .accessibilityLabel("Refresh Mac Codex app")
     }
 }
 

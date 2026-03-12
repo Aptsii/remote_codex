@@ -80,6 +80,7 @@ final class TurnViewModel {
     var isHandlingApproval = false
     var isPlanModeArmed = false
     var steeringDraftID: String?
+    var isRefreshingDesktopApp = false
     var shouldAnchorToAssistantResponse = false
     var isScrolledToBottom = true
     var isPhotoPickerPresented = false
@@ -257,6 +258,26 @@ final class TurnViewModel {
         composerAttachments.removeAll()
         composerMentionedFiles.removeAll()
         composerMentionedSkills.removeAll()
+    }
+
+    func refreshDesktopApp(codex: CodexService, threadID: String) {
+        guard codex.isConnected, !isRefreshingDesktopApp else {
+            return
+        }
+
+        isRefreshingDesktopApp = true
+        Task { @MainActor in
+            defer { isRefreshingDesktopApp = false }
+
+            do {
+                try await codex.refreshDesktopApp(threadId: threadID)
+            } catch {
+                let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+                codex.lastErrorMessage = message.isEmpty
+                    ? "Unable to refresh Codex on Mac."
+                    : message
+            }
+        }
     }
 
     func setPlanModeArmed(_ isArmed: Bool) {

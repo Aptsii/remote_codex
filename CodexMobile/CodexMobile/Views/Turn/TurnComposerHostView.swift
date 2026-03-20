@@ -17,7 +17,6 @@ struct TurnComposerHostView: View {
     let orderedModelOptions: [CodexModelOption]
     let selectedModelTitle: String
     let reasoningDisplayOptions: [TurnComposerReasoningDisplayOption]
-    let selectedReasoningTitle: String
     let showsGitControls: Bool
     let isGitBranchSelectorEnabled: Bool
     let onSelectGitBranch: (String) -> Void
@@ -51,8 +50,14 @@ struct TurnComposerHostView: View {
             composerAttachments: viewModel.composerAttachments,
             composerMentionedFiles: viewModel.composerMentionedFiles,
             composerMentionedSkills: viewModel.composerMentionedSkills,
-            composerReviewSelection: viewModel.composerReviewSelection
+            composerReviewSelection: viewModel.composerReviewSelection,
+            isSubagentsSelectionArmed: viewModel.isSubagentsSelectionArmed
         )
+        let runtimeState = TurnComposerRuntimeState.resolve(
+            codex: codex,
+            reasoningDisplayOptions: reasoningDisplayOptions
+        )
+        let runtimeActions = TurnComposerRuntimeActions.resolve(codex: codex)
 
         TurnComposerView(
             input: $viewModel.input,
@@ -71,16 +76,14 @@ struct TurnComposerHostView: View {
             selectedModelID: codex.selectedModelOption()?.id,
             selectedModelTitle: selectedModelTitle,
             isLoadingModels: codex.isLoadingModels,
-            reasoningDisplayOptions: reasoningDisplayOptions,
-            selectedReasoningEffort: codex.selectedReasoningEffortForSelectedModel(),
-            selectedReasoningTitle: selectedReasoningTitle,
-            reasoningMenuDisabled: reasoningDisplayOptions.isEmpty || codex.selectedModelOption() == nil,
-            selectedServiceTier: codex.selectedServiceTier,
+            runtimeState: runtimeState,
+            runtimeActions: runtimeActions,
             selectedAccessMode: codex.selectedAccessMode,
             contextWindowUsage: codex.contextWindowUsageByThread[thread.id],
             showsGitBranchSelector: showsGitControls,
             isGitBranchSelectorEnabled: isGitBranchSelectorEnabled,
             availableGitBranchTargets: viewModel.availableGitBranchTargets,
+            gitBranchesCheckedOutElsewhere: viewModel.gitBranchesCheckedOutElsewhere,
             selectedGitBaseBranch: viewModel.selectedGitBaseBranch,
             currentGitBranch: viewModel.currentGitBranch,
             gitDefaultBranch: viewModel.gitDefaultBranch,
@@ -92,9 +95,7 @@ struct TurnComposerHostView: View {
             onRefreshContextWindowUsage: {
                 await codex.refreshContextWindowUsage(threadId: thread.id)
             },
-            onSelectModel: codex.setSelectedModelId,
-            onSelectReasoning: codex.setSelectedReasoningEffort,
-            onSelectServiceTier: codex.setSelectedServiceTier,
+            onShowStatus: onShowStatus,
             onSelectAccessMode: codex.setSelectedAccessMode,
             onTapAddImage: { viewModel.openPhotoLibraryPicker(codex: codex) },
             onTapTakePhoto: { viewModel.openCamera(codex: codex) },
@@ -134,6 +135,8 @@ struct TurnComposerHostView: View {
                 case .status:
                     viewModel.onSelectSlashCommand(command)
                     onShowStatus()
+                case .subagents:
+                    viewModel.onSelectSlashCommand(command)
                 }
             },
             onSelectCodeReviewTarget: { target in
@@ -143,6 +146,7 @@ struct TurnComposerHostView: View {
             onRemoveMentionedFile: viewModel.removeMentionedFile,
             onRemoveMentionedSkill: viewModel.removeMentionedSkill,
             onRemoveComposerReviewSelection: viewModel.clearComposerReviewSelection,
+            onRemoveComposerSubagentsSelection: viewModel.clearSubagentsSelection,
             onPasteImageData: { imageDataItems in
                 viewModel.enqueuePastedImageData(imageDataItems, codex: codex)
             },

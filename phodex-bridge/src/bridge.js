@@ -12,27 +12,33 @@ const {
 } = require("./codex-desktop-refresher");
 const { createCodexTransport } = require("./codex-transport");
 const { createThreadRolloutActivityWatcher } = require("./rollout-watch");
+const { DEFAULT_RELAY_FALLBACK_HOST } = require("./relay-config");
+const { startLocalRelayServer } = require("./local-relay-server");
 const { printQR } = require("./qr");
 const { rememberActiveThread } = require("./session-state");
+const { createDesktopRequestHandler } = require("./desktop-handler");
 const { handleGitRequest } = require("./git-handler");
 const { handleThreadContextRequest } = require("./thread-context-handler");
+const { handleThreadTailRequest } = require("./thread-tail-handler");
+const { enrichThreadListResponse } = require("./thread-list-enricher");
 const { handleWorkspaceRequest } = require("./workspace-handler");
 const { loadOrCreateBridgeDeviceState } = require("./secure-device-state");
 const { createBridgeSecureTransport } = require("./secure-transport");
 
 function startBridge() {
   const config = readBridgeConfig();
+  let relayServer = null;
   const sessionId = uuidv4();
-  const relayBaseUrl = config.relayUrl.replace(/\/+$/, "");
-  const relaySessionUrl = `${relayBaseUrl}/${sessionId}`;
   const deviceState = loadOrCreateBridgeDeviceState();
   const desktopRefresher = new CodexDesktopRefresher({
     enabled: config.refreshEnabled,
     debounceMs: config.refreshDebounceMs,
     refreshCommand: config.refreshCommand,
+    refreshMode: config.refreshMode,
     bundleId: config.codexBundleId,
     appPath: config.codexAppPath,
   });
+  const handleDesktopRequest = createDesktopRequestHandler({ desktopRefresher });
 
   // Keep the local Codex runtime alive across transient relay disconnects.
   let socket = null;
@@ -42,13 +48,12 @@ function startBridge() {
   let lastConnectionStatus = null;
   let codexHandshakeState = config.codexEndpoint ? "warm" : "cold";
   const forwardedInitializeRequestIds = new Set();
-  const secureTransport = createBridgeSecureTransport({
-    sessionId,
-    relayUrl: relayBaseUrl,
-    deviceState,
-  });
+  let relayBaseUrl = "";
+  let relaySessionUrl = "";
+  let secureTransport = null;
   let contextUsageWatcher = null;
   let watchedContextUsageKey = null;
+  const pendingCodexRequests = new Map();
 
   const codex = createCodexTransport({
     endpoint: config.codexEndpoint,
@@ -57,6 +62,7 @@ function startBridge() {
   });
 
   codex.onError((error) => {
+    closeRelayServer();
     if (config.codexEndpoint) {
       console.error(`[remodex] Failed to connect to Codex endpoint: ${config.codexEndpoint}`);
     } else {
@@ -168,14 +174,25 @@ function startBridge() {
     });
   }
 
-  printQR(secureTransport.createPairingPayload());
-  connectRelay();
+  initializeRelay()
+    .then(() => {
+      printQR(secureTransport.createPairingPayload());
+      connectRelay();
+    })
+    .catch((error) => {
+      console.error(error.message);
+      process.exit(1);
+    });
 
   codex.onMessage((message) => {
-    trackCodexHandshakeState(message);
-    desktopRefresher.handleOutbound(message);
-    rememberThreadFromMessage("codex", message);
-    secureTransport.queueOutboundApplicationMessage(message, (wireMessage) => {
+    if (!secureTransport) {
+      return;
+    }
+    let outboundMessage = rewriteCodexResponseIfNeeded(message);
+    trackCodexHandshakeState(outboundMessage);
+    desktopRefresher.handleOutbound(outboundMessage);
+    rememberThreadFromMessage("codex", outboundMessage);
+    secureTransport.queueOutboundApplicationMessage(outboundMessage, (wireMessage) => {
       if (socket?.readyState === WebSocket.OPEN) {
         socket.send(wireMessage);
       }
@@ -186,6 +203,7 @@ function startBridge() {
     logConnectionStatus("disconnected");
     isShuttingDown = true;
     clearReconnectTimer();
+    closeRelayServer();
     stopContextUsageWatcher();
     desktopRefresher.handleTransportReset();
     if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) {
@@ -196,10 +214,14 @@ function startBridge() {
   process.on("SIGINT", () => shutdown(codex, () => socket, () => {
     isShuttingDown = true;
     clearReconnectTimer();
+    closeRelayServer();
+    stopContextUsageWatcher();
   }));
   process.on("SIGTERM", () => shutdown(codex, () => socket, () => {
     isShuttingDown = true;
     clearReconnectTimer();
+    closeRelayServer();
+    stopContextUsageWatcher();
   }));
 
   // Routes decrypted app payloads through the same bridge handlers as before.
@@ -210,6 +232,12 @@ function startBridge() {
     if (handleThreadContextRequest(rawMessage, sendApplicationResponse)) {
       return;
     }
+    if (handleThreadTailRequest(rawMessage, sendApplicationResponse)) {
+      return;
+    }
+    if (handleDesktopRequest(rawMessage, sendApplicationResponse)) {
+      return;
+    }
     if (handleWorkspaceRequest(rawMessage, sendApplicationResponse)) {
       return;
     }
@@ -218,6 +246,7 @@ function startBridge() {
     }
     desktopRefresher.handleInbound(rawMessage);
     rememberThreadFromMessage("phone", rawMessage);
+    trackPendingCodexRequest(rawMessage);
     codex.send(rawMessage);
   }
 
@@ -375,6 +404,102 @@ function startBridge() {
     if (errorMessage.includes("already initialized")) {
       codexHandshakeState = "warm";
     }
+  }
+
+  function trackPendingCodexRequest(rawMessage) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(rawMessage);
+    } catch {
+      return;
+    }
+
+    if (parsed?.id == null || typeof parsed?.method !== "string") {
+      return;
+    }
+
+    pendingCodexRequests.set(String(parsed.id), {
+      method: parsed.method.trim(),
+      params: parsed.params && typeof parsed.params === "object" ? parsed.params : null,
+    });
+    if (pendingCodexRequests.size > 256) {
+      const oldestKey = pendingCodexRequests.keys().next().value;
+      if (oldestKey != null) {
+        pendingCodexRequests.delete(oldestKey);
+      }
+    }
+  }
+
+  function rewriteCodexResponseIfNeeded(rawMessage) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(rawMessage);
+    } catch {
+      return rawMessage;
+    }
+
+    if (parsed?.id == null) {
+      return rawMessage;
+    }
+
+    const requestKey = String(parsed.id);
+    const pendingRequest = pendingCodexRequests.get(requestKey);
+    if (!pendingRequest) {
+      return rawMessage;
+    }
+
+    pendingCodexRequests.delete(requestKey);
+
+    if (pendingRequest.method !== "thread/list" || parsed?.error != null) {
+      return rawMessage;
+    }
+
+    try {
+      return JSON.stringify(enrichThreadListResponse(parsed, {
+        requestParams: pendingRequest.params,
+      }));
+    } catch {
+      return rawMessage;
+    }
+  }
+
+  async function initializeRelay() {
+    if (config.managedRelay) {
+      relayServer = await startLocalRelayServer({
+        bindHost: config.relayBindHost,
+        port: config.relayPort,
+        advertisedHost: config.relayAdvertiseHost,
+      });
+      relayBaseUrl = relayServer.relayUrl.replace(/\/+$/, "");
+      if (relayServer.reusedExisting) {
+        console.log(`[remodex] using existing local relay at ${relayBaseUrl}`);
+      } else {
+        console.log(`[remodex] local relay ready at ${relayBaseUrl}`);
+      }
+      if (config.relayAdvertiseHost === DEFAULT_RELAY_FALLBACK_HOST) {
+        console.log(
+          "[remodex] no LAN IP was detected; set REMODEX_RELAY_HOST to your Mac's reachable IP if the phone cannot connect."
+        );
+      }
+    } else {
+      relayBaseUrl = config.relayUrl.replace(/\/+$/, "");
+      console.log(`[remodex] relay endpoint ${relayBaseUrl}`);
+    }
+
+    relaySessionUrl = `${relayBaseUrl}/${sessionId}`;
+    secureTransport = createBridgeSecureTransport({
+      sessionId,
+      relayUrl: relayBaseUrl,
+      deviceState,
+    });
+  }
+
+  function closeRelayServer() {
+    if (!relayServer) {
+      return;
+    }
+    relayServer.close().catch(() => {});
+    relayServer = null;
   }
 }
 

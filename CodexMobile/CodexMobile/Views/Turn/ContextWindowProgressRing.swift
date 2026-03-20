@@ -9,6 +9,7 @@ import SwiftUI
 struct ContextWindowProgressRing: View {
     let usage: ContextWindowUsage?
     let onRefresh: (() async -> Void)?
+    let onShowStatus: (() -> Void)?
     @State private var isShowingPopover = false
     @State private var isRefreshing = false
 
@@ -79,34 +80,54 @@ struct ContextWindowProgressRing: View {
             if let onRefresh {
                 Divider()
 
-                Button {
-                    guard !isRefreshing else { return }
-                    HapticFeedback.shared.triggerImpactFeedback(style: .light)
-                    isRefreshing = true
+                VStack(spacing: 8) {
+                    if let onShowStatus {
+                        Button {
+                            HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                            isShowingPopover = false
+                            onShowStatus()
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "slider.horizontal.3")
+                                    .font(AppFont.system(size: 12, weight: .semibold))
 
-                    Task {
-                        await onRefresh()
-                        await MainActor.run {
-                            isRefreshing = false
+                                Text("Status")
+                                    .font(AppFont.subheadline(weight: .semibold))
+                            }
+                            .frame(maxWidth: .infinity)
                         }
+                        .buttonStyle(.plain)
                     }
-                } label: {
-                    HStack(spacing: 8) {
-                        if isRefreshing {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
-                            Image(systemName: "arrow.clockwise")
-                                .font(AppFont.system(size: 12, weight: .semibold))
-                        }
 
-                        Text(isRefreshing ? "Refreshing..." : "Refresh")
-                            .font(AppFont.subheadline(weight: .semibold))
+                    Button {
+                        guard !isRefreshing else { return }
+                        HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                        isRefreshing = true
+
+                        Task {
+                            await onRefresh()
+                            await MainActor.run {
+                                isRefreshing = false
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if isRefreshing {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(AppFont.system(size: 12, weight: .semibold))
+                            }
+
+                            Text(isRefreshing ? "Refreshing..." : "Refresh")
+                                .font(AppFont.subheadline(weight: .semibold))
+                        }
+                        .frame(maxWidth: .infinity)
                     }
-                    .frame(maxWidth: .infinity)
+                    .buttonStyle(.plain)
+                    .disabled(isRefreshing)
                 }
-                .buttonStyle(.plain)
-                .disabled(isRefreshing)
             }
         }
         .padding()

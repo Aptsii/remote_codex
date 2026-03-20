@@ -31,9 +31,95 @@ struct CodexRunningThreadWatch: Equatable, Sendable {
     let expiresAt: Date
 }
 
+struct CodexSubagentIdentityEntry: Equatable, Sendable {
+    var threadId: String?
+    var agentId: String?
+    var nickname: String?
+    var role: String?
+
+    var hasMetadata: Bool {
+        threadId != nil || agentId != nil || nickname != nil || role != nil
+    }
+}
+
 struct CodexSecureControlWaiter {
     let id: UUID
     let continuation: CheckedContinuation<String, Error>
+}
+
+enum CodexWebSocketTransport {
+    case network(NWConnection)
+    case manualTCP(NWConnection)
+    case urlSession(URLSession, URLSessionWebSocketTask)
+}
+
+final class CodexURLSessionWebSocketDelegate: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDelegate {
+    private let lock = NSLock()
+    private var openContinuation: CheckedContinuation<Void, Error>?
+    private var openResult: Result<Void, Error>?
+
+    // Waits for URLSession to confirm the websocket handshake before connect() continues.
+    func waitForOpen() async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            defer { lock.unlock() }
+            if let openResult {
+                continuation.resume(with: openResult)
+                return
+            }
+            openContinuation = continuation
+        }
+    }
+
+    // Resolves the initial websocket open exactly once from any delegate callback.
+    func resolveOpen(with result: Result<Void, Error>) {
+        lock.lock()
+        guard openResult == nil else {
+            lock.unlock()
+            return
+        }
+        openResult = result
+        let continuation = openContinuation
+        openContinuation = nil
+        lock.unlock()
+        continuation?.resume(with: result)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        webSocketTask: URLSessionWebSocketTask,
+        didOpenWithProtocol protocol: String?
+    ) {
+        resolveOpen(with: .success(()))
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        webSocketTask: URLSessionWebSocketTask,
+        didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
+        reason: Data?
+    ) {
+        if closeCode == .invalid {
+            resolveOpen(with: .failure(CodexServiceError.disconnected))
+            return
+        }
+
+        resolveOpen(
+            with: .failure(
+                CodexServiceError.invalidInput("WebSocket closed during connect (\(closeCode.rawValue))")
+            )
+        )
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        if let error {
+            resolveOpen(with: .failure(error))
+        }
+    }
 }
 
 struct CodexBridgeUpdatePrompt: Identifiable, Equatable, Sendable {
@@ -43,13 +129,36 @@ struct CodexBridgeUpdatePrompt: Identifiable, Equatable, Sendable {
     let command: String
 }
 
+struct CodexThreadRuntimeOverride: Codable, Equatable, Sendable {
+    var reasoningEffort: String?
+    var serviceTierRawValue: String?
+    var overridesReasoning: Bool
+    var overridesServiceTier: Bool
+
+    var serviceTier: CodexServiceTier? {
+        guard let serviceTierRawValue else {
+            return nil
+        }
+        return CodexServiceTier(rawValue: serviceTierRawValue)
+    }
+
+    var isEmpty: Bool {
+        !overridesReasoning && !overridesServiceTier
+    }
+}
+
 struct CodexThreadCompletionBanner: Identifiable, Equatable, Sendable {
     let id = UUID()
     let threadId: String
     let title: String
 }
 
-enum CodexThreadRunBadgeState: Equatable, Sendable {
+struct CodexMissingNotificationThreadPrompt: Identifiable, Equatable, Sendable {
+    let id = UUID()
+    let threadId: String
+}
+
+enum CodexThreadRunBadgeState: Hashable, Sendable {
     case running
     case ready
     case failed
@@ -160,7 +269,11 @@ struct AssistantRevertStateCacheEntry {
 final class CodexService {
     // --- Public state ---------------------------------------------------------
 
-    var threads: [CodexThread] = []
+    var threads: [CodexThread] = [] {
+        didSet {
+            rebuildThreadLookupCaches()
+        }
+    }
     var isConnected = false
     var isConnecting = false
     var isInitialized = false
@@ -199,6 +312,8 @@ final class CodexService {
     var selectedModelId: String?
     var selectedReasoningEffort: String?
     var selectedServiceTier: CodexServiceTier?
+    // Per-chat runtime overrides let the composer diverge from app-wide defaults.
+    var threadRuntimeOverridesByThreadID: [String: CodexThreadRuntimeOverride] = [:]
     var selectedAccessMode: CodexAccessMode = .onRequest
     var isLoadingModels = false
     var modelsErrorMessage: String?
@@ -211,6 +326,8 @@ final class CodexService {
     var supportsServiceTier = true
     // Seeds brand-new chats with one-shot composer actions like code review.
     var pendingComposerActionByThreadID: [String: CodexPendingThreadComposerAction] = [:]
+    // In-memory identity directory for subagents, keyed by thread id and agent id.
+    var subagentIdentityVersion: Int = 0
 
     // Relay session persistence
     var relaySessionId: String?
@@ -219,6 +336,10 @@ final class CodexService {
     var relayMacIdentityPublicKey: String?
     var relayProtocolVersion: Int = codexSecureProtocolVersion
     var lastAppliedBridgeOutboundSeq = 0
+    // Fresh QR scans must use bootstrap once, even if this Mac was already trusted before.
+    var shouldForceQRBootstrapOnNextHandshake = false
+    // Stops infinite trusted-reconnect loops by escalating back to QR after repeated handshake failures.
+    var trustedReconnectFailureCount = 0
     var secureConnectionState: CodexSecureConnectionState = .notPaired
     var secureMacFingerprint: String?
     // Keeps the bridge-update UX visible even if connection cleanup resets secure transport state.
@@ -226,10 +347,18 @@ final class CodexService {
     var hasPresentedServiceTierBridgeUpdatePrompt = false
     // Mirrors the sidebar ready-dot with a tappable in-app banner when another chat finishes.
     var threadCompletionBanner: CodexThreadCompletionBanner?
+    // Explains why a push-opened chat could not be restored and offers a recovery path.
+    var missingNotificationThreadPrompt: CodexMissingNotificationThreadPrompt?
 
     // --- Internal wiring ------------------------------------------------------
 
     var webSocketConnection: NWConnection?
+    var webSocketSession: URLSession?
+    var webSocketSessionDelegate: CodexURLSessionWebSocketDelegate?
+    var webSocketTask: URLSessionWebSocketTask?
+    // Raw frame buffer used when the relay runs over manual TCP websocket framing.
+    var manualWebSocketReadBuffer = Data()
+    var usesManualWebSocketTransport = false
     let webSocketQueue = DispatchQueue(label: "CodexMobile.WebSocket", qos: .userInitiated)
     var pendingRequests: [String: CheckedContinuation<RPCMessage, Error>] = [:]
     // Test hook: intercepts outbound RPC requests without requiring a live socket.
@@ -240,6 +369,8 @@ final class CodexService {
     var commandExecutionDetailsByItemID: [String: CommandExecutionDetails] = [:]
     // Debounces disk writes while streaming to keep UI responsive.
     var messagePersistenceDebounceTask: Task<Void, Never>?
+    // Coalesces multiple invalidateAssistantRevertStates() calls within the same run loop tick into one refresh.
+    var coalescedRevertRefreshTask: Task<Void, Never>?
     // Dedupes completion payloads when servers omit turn/item identifiers.
     var assistantCompletionFingerprintByThread: [String: (text: String, timestamp: Date)] = [:]
     // Dedupes concise activity feed lines per thread/turn to avoid visual spam.
@@ -250,7 +381,10 @@ final class CodexService {
     var rateLimitsErrorMessage: String?
     var threadIdByTurnID: [String: String] = [:]
     var hydratedThreadIDs: Set<String> = []
+    // Tracks threads whose complete history has been loaded via thread/read(includeTurns=true).
+    var fullHistoryHydratedThreadIDs: Set<String> = []
     var loadingThreadIDs: Set<String> = []
+    @ObservationIgnored var subagentMetadataLoadingThreadIDs: Set<String> = []
     var resumedThreadIDs: Set<String> = []
     var isAppInForeground = true
     var threadListSyncTask: Task<Void, Never>?
@@ -260,11 +394,18 @@ final class CodexService {
     var postConnectSyncToken: UUID?
     var connectedServerIdentity: String?
     var runningThreadWatchByID: [String: CodexRunningThreadWatch] = [:]
+    var mirroredRunningCatchupThreadIDs: Set<String> = []
+    var lastMirroredRunningCatchupAtByThread: [String: Date] = [:]
+    var localNetworkAuthorizationStatus: LocalNetworkAuthorizationStatus = .unknown
     var backgroundTurnGraceTaskID: UIBackgroundTaskIdentifier = .invalid
     var hasConfiguredNotifications = false
     var runCompletionNotificationDedupedAt: [String: Date] = [:]
     var notificationCenterDelegateProxy: CodexNotificationCenterDelegateProxy?
+    var notificationObserverTokens: [NSObjectProtocol] = []
+    var lastPushRegistrationSignature: String?
     var shouldAutoReconnectOnForeground = false
+    // Test hook so connection handling can model `.inactive` without waiting for real app lifecycle changes.
+    @ObservationIgnored var applicationStateProvider: () -> UIApplication.State = { UIApplication.shared.applicationState }
     var secureSession: CodexSecureSession?
     var pendingHandshake: CodexPendingHandshake?
     var phoneIdentityState: CodexPhoneIdentityState
@@ -275,12 +416,20 @@ final class CodexService {
     var aiChangeSetsByID: [String: AIChangeSet] = [:]
     var aiChangeSetIDByTurnID: [String: String] = [:]
     var aiChangeSetIDByAssistantMessageID: [String: String] = [:]
+    // Keeps hot-path thread lookups O(1) instead of rescanning the full sidebar list.
+    @ObservationIgnored var threadByID: [String: CodexThread] = [:]
+    @ObservationIgnored var threadIndexByID: [String: Int] = [:]
+    @ObservationIgnored var firstLiveThreadIDCache: String?
+    @ObservationIgnored var subagentIdentityByThreadID: [String: CodexSubagentIdentityEntry] = [:]
+    @ObservationIgnored var subagentIdentityByAgentID: [String: CodexSubagentIdentityEntry] = [:]
     // Canonical repo roots keyed by observed working directories from bridge git/status responses.
     var repoRootByWorkingDirectory: [String: String] = [:]
     var knownRepoRoots: Set<String> = []
     // Service-owned per-thread UI state keeps the active chat isolated from unrelated thread mutations.
     @ObservationIgnored var threadTimelineStateByThread: [String: ThreadTimelineState] = [:]
     @ObservationIgnored var stoppedTurnIDsByThread: [String: Set<String>] = [:]
+    // Lazily rebuilt id->index maps keep hot-path message lookups out of repeated linear scans.
+    @ObservationIgnored var messageIndexCacheByThread: [String: [String: Int]] = [:]
     @ObservationIgnored var latestAssistantOutputByThread: [String: String] = [:]
     @ObservationIgnored var latestRepoAffectingMessageSignalByThread: [String: String] = [:]
     @ObservationIgnored var assistantRevertStateCacheByThread: [String: AssistantRevertStateCacheEntry] = [:]
@@ -298,6 +447,7 @@ final class CodexService {
     static let selectedModelIdDefaultsKey = "codex.selectedModelId"
     static let selectedReasoningEffortDefaultsKey = "codex.selectedReasoningEffort"
     static let selectedServiceTierDefaultsKey = "codex.selectedServiceTier"
+    static let threadRuntimeOverridesDefaultsKey = "codex.threadRuntimeOverrides"
     static let selectedAccessModeDefaultsKey = "codex.selectedAccessMode"
     static let locallyArchivedThreadIDsKey = "codex.locallyArchivedThreadIDs"
     static let notificationsPromptedDefaultsKey = "codex.notifications.prompted"
@@ -324,6 +474,7 @@ final class CodexService {
         }
         CodexMessageOrderCounter.seed(from: loadedMessages)
         self.messagesByThread = loadedMessages
+        rebuildSubagentIdentityDirectory()
 
         let loadedChangeSets = aiChangeSetPersistence.load()
         self.aiChangeSetsByID = loadedChangeSets.reduce(into: [:]) { partialResult, changeSet in
@@ -345,6 +496,16 @@ final class CodexService {
         let savedReasoning = defaults.string(forKey: Self.selectedReasoningEffortDefaultsKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         self.selectedReasoningEffort = (savedReasoning?.isEmpty == false) ? savedReasoning : nil
+
+        if let savedThreadRuntimeOverrides = defaults.data(forKey: Self.threadRuntimeOverridesDefaultsKey),
+           let decodedThreadRuntimeOverrides = try? decoder.decode(
+               [String: CodexThreadRuntimeOverride].self,
+               from: savedThreadRuntimeOverrides
+           ) {
+            self.threadRuntimeOverridesByThreadID = decodedThreadRuntimeOverrides
+        } else {
+            self.threadRuntimeOverridesByThreadID = [:]
+        }
 
         let savedServiceTier = defaults.string(forKey: Self.selectedServiceTierDefaultsKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -384,6 +545,7 @@ final class CodexService {
             self.secureConnectionState = .trustedMac
             self.secureMacFingerprint = codexSecureFingerprint(for: trustedMac.macIdentityPublicKey)
         }
+        rebuildThreadLookupCaches()
     }
 
     // Remembers whether we can offer reconnect without forcing a fresh QR scan.

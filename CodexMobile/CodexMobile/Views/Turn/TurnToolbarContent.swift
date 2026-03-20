@@ -14,6 +14,10 @@ struct TurnThreadNavigationContext {
 struct TurnToolbarContent: ToolbarContent {
     let displayTitle: String
     let navigationContext: TurnThreadNavigationContext?
+    let showsMacHandoff: Bool
+    let isHandingOffToMac: Bool
+    let showsDesktopRefreshButton: Bool
+    let isRefreshingDesktopApp: Bool
     let repoDiffTotals: GitDiffTotals?
     let isLoadingRepoDiff: Bool
     let showsGitActions: Bool
@@ -21,12 +25,16 @@ struct TurnToolbarContent: ToolbarContent {
     let isRunningGitAction: Bool
     let showsDiscardRuntimeChangesAndSync: Bool
     let gitSyncState: String?
+    var onTapMacHandoff: (() -> Void)?
+    var onRefreshDesktopApp: (() -> Void)?
     var onTapRepoDiff: (() -> Void)?
     let onGitAction: (TurnGitActionKind) -> Void
 
     @Binding var isShowingPathSheet: Bool
 
     var body: some ToolbarContent {
+        let hasTrailingCluster = repoDiffTotals != nil || showsGitActions
+
         ToolbarItem(placement: .principal) {
             VStack(alignment: .leading, spacing: 1) {
                 Text(displayTitle)
@@ -52,13 +60,39 @@ struct TurnToolbarContent: ToolbarContent {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
 
-        ToolbarItem(placement: .topBarTrailing) {
-            HStack(spacing: 10) {
+        if showsMacHandoff, let onTapMacHandoff {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                    onTapMacHandoff()
+                } label: {
+                    TurnMacHandoffToolbarLabel(isLoading: isHandingOffToMac)
+                }
+                .disabled(isHandingOffToMac)
+                .accessibilityLabel("Hand off to Mac app")
+            }
+        }
+
+        if showsMacHandoff, onTapMacHandoff != nil, hasTrailingCluster {
+            if #available(iOS 26.0, *) {
+                ToolbarSpacer(.fixed, placement: .topBarTrailing)
+            }
+        }
+
+        if repoDiffTotals != nil || showsGitActions {
+            ToolbarItemGroup(placement: .topBarTrailing) {
                 if let repoDiffTotals {
                     TurnToolbarDiffTotalsLabel(
                         totals: repoDiffTotals,
                         isLoading: isLoadingRepoDiff,
                         onTap: onTapRepoDiff
+                    )
+                }
+
+                if showsDesktopRefreshButton, let onRefreshDesktopApp {
+                    TurnDesktopRefreshToolbarButton(
+                        isRefreshing: isRefreshingDesktopApp,
+                        onTap: onRefreshDesktopApp
                     )
                 }
 
@@ -76,13 +110,70 @@ struct TurnToolbarContent: ToolbarContent {
     }
 }
 
+private struct TurnDesktopRefreshToolbarButton: View {
+    let isRefreshing: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        Button {
+            HapticFeedback.shared.triggerImpactFeedback(style: .light)
+            onTap()
+        } label: {
+            Group {
+                if isRefreshing {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .frame(width: 28, height: 28)
+                } else {
+                    Image(systemName: "arrow.clockwise.circle")
+                        .font(.system(size: 17, weight: .semibold))
+                        .frame(width: 28, height: 28)
+                }
+            }
+            .contentShape(Circle())
+            .adaptiveToolbarItem(in: Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isRefreshing)
+        .accessibilityLabel("Refresh Mac Codex app")
+    }
+}
+
+private struct TurnMacHandoffToolbarLabel: View {
+    let isLoading: Bool
+
+    private let iconSize: CGFloat = 10
+    private let minToolbarButtonSize: CGFloat = 32
+
+    var body: some View {
+        Group {
+            if isLoading {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 24, height: 24)
+            } else {
+                VStack(spacing: 1.5) {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: iconSize, weight: .semibold))
+                    Image(systemName: "arrow.left")
+                        .font(.system(size: iconSize, weight: .semibold))
+                }
+                .foregroundStyle(.primary)
+                .frame(width: 24, height: 24)
+            }
+        }
+        .contentShape(Circle())
+        .adaptiveToolbarItem(in: Circle())
+    }
+}
+
 private struct TurnToolbarDiffTotalsLabel: View {
     let totals: GitDiffTotals
     let isLoading: Bool
     let onTap: (() -> Void)?
 
     // Keeps small diff totals tappable without forcing large-count pills into a fixed width.
-    private let minPillWidth: CGFloat = 64
+    private let minPillWidth: CGFloat = 50
 
     var body: some View {
         Group {

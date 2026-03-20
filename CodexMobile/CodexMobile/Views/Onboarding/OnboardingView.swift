@@ -57,13 +57,14 @@ struct OnboardingView: View {
                                 OnboardingStepRow(
                                     number: "1",
                                     title: "Install the package",
-                                    command: "npm install -g remodex@latest"
+                                    command: "npm install -g remodex"
                                 )
 
                                 OnboardingStepRow(
                                     number: "2",
-                                    title: "Start the relay",
-                                    command: "remodex up"
+                                    title: "Start Remodex on your Mac",
+                                    command: "remodex up",
+                                    subtitle: "This starts the local bridge and uses a local relay by default."
                                 )
 
                                 OnboardingStepRow(

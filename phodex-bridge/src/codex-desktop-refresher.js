@@ -7,6 +7,7 @@
 const { execFile } = require("child_process");
 const path = require("path");
 const { createThreadRolloutActivityWatcher } = require("./rollout-watch");
+const { readRelayConfig } = require("./relay-config");
 
 const DEFAULT_BUNDLE_ID = "com.openai.codex";
 const DEFAULT_APP_PATH = "/Applications/Codex.app";
@@ -16,6 +17,7 @@ const DEFAULT_MID_RUN_REFRESH_THROTTLE_MS = 3_000;
 const DEFAULT_ROLLOUT_LOOKUP_TIMEOUT_MS = 5_000;
 const DEFAULT_ROLLOUT_IDLE_TIMEOUT_MS = 10_000;
 const DEFAULT_CUSTOM_REFRESH_FAILURE_THRESHOLD = 3;
+const DEFAULT_REFRESH_MODE = "bounce";
 const REFRESH_SCRIPT_PATH = path.join(__dirname, "scripts", "codex-refresh.applescript");
 const NEW_THREAD_DEEP_LINK = "codex://threads/new";
 
@@ -24,6 +26,7 @@ class CodexDesktopRefresher {
     enabled = true,
     debounceMs = DEFAULT_DEBOUNCE_MS,
     refreshCommand = "",
+    refreshMode = DEFAULT_REFRESH_MODE,
     bundleId = DEFAULT_BUNDLE_ID,
     appPath = DEFAULT_APP_PATH,
     logPrefix = "[remodex]",
@@ -40,6 +43,7 @@ class CodexDesktopRefresher {
     this.enabled = enabled;
     this.debounceMs = debounceMs;
     this.refreshCommand = refreshCommand;
+    this.refreshMode = normalizeRefreshMode(refreshMode);
     this.bundleId = bundleId;
     this.appPath = appPath;
     this.logPrefix = logPrefix;
@@ -258,8 +262,9 @@ class CodexDesktopRefresher {
       this.clearPendingTarget();
     }
     this.refreshRunning = true;
+    const refreshMode = this.resolveRefreshMode(pendingRefreshKinds);
     this.log(
-      `refresh running: ${Array.from(pendingRefreshKinds).join("+")}${targetThreadId ? ` thread=${targetThreadId}` : ""}`
+      `refresh running: ${Array.from(pendingRefreshKinds).join("+")}${targetThreadId ? ` thread=${targetThreadId}` : ""} mode=${refreshMode}`
     );
 
     let didRefresh = false;
@@ -272,7 +277,7 @@ class CodexDesktopRefresher {
       ) {
         this.log(`refresh skipped (duplicate target): ${refreshSignature}`);
       } else {
-        await this.executeRefresh(targetUrl);
+        await this.executeRefresh(targetUrl, refreshMode);
         this.lastRefreshAt = this.now();
         this.lastRefreshSignature = refreshSignature;
         this.consecutiveRefreshFailures = 0;
@@ -301,9 +306,9 @@ class CodexDesktopRefresher {
     }
   }
 
-  executeRefresh(targetUrl) {
+  executeRefresh(targetUrl, refreshMode = DEFAULT_REFRESH_MODE) {
     if (this.refreshExecutor) {
-      return this.refreshExecutor(targetUrl || "");
+      return this.refreshExecutor(targetUrl || "", refreshMode);
     }
 
     if (this.refreshCommand) {
@@ -315,7 +320,45 @@ class CodexDesktopRefresher {
       this.bundleId,
       this.appPath,
       targetUrl || "",
+      refreshMode,
     ]);
+  }
+
+  async runManualRefresh(target = {}) {
+    const threadId = typeof target?.threadId === "string" && target.threadId
+      ? target.threadId
+      : "";
+    const targetUrl = target?.url || (threadId ? buildThreadDeepLink(threadId) : "");
+    const refreshMode = "relaunch";
+
+    this.log(`manual refresh running${threadId ? ` thread=${threadId}` : ""} mode=${refreshMode}`);
+
+    try {
+      await this.executeRefresh(targetUrl, refreshMode);
+      this.lastRefreshAt = this.now();
+      this.lastRefreshSignature = `${targetUrl || "app"}|${threadId || "no-thread"}`;
+      this.consecutiveRefreshFailures = 0;
+
+      return {
+        threadId: threadId || null,
+        targetUrl,
+        mode: refreshMode,
+      };
+    } catch (error) {
+      this.handleRefreshFailure(error);
+      throw error;
+    }
+  }
+
+  resolveRefreshMode(pendingRefreshKinds) {
+    if (this.refreshMode !== "relaunch") {
+      return DEFAULT_REFRESH_MODE;
+    }
+
+    const onlyRolloutGrowth = pendingRefreshKinds.size > 0
+      && Array.from(pendingRefreshKinds).every((kind) => kind === "rollout_growth");
+
+    return onlyRolloutGrowth ? DEFAULT_REFRESH_MODE : "relaunch";
   }
 
   clearPendingState() {
@@ -515,7 +558,11 @@ class CodexDesktopRefresher {
   }
 }
 
-function readBridgeConfig({ env = process.env, platform = process.platform } = {}) {
+function readBridgeConfig({
+  env = process.env,
+  platform = process.platform,
+  networkInterfaces,
+} = {}) {
   const codexEndpoint = readFirstDefinedEnv(
     ["REMODEX_CODEX_ENDPOINT", "PHODEX_CODEX_ENDPOINT"],
     "",
@@ -526,15 +573,20 @@ function readBridgeConfig({ env = process.env, platform = process.platform } = {
     "",
     env
   );
+  const refreshMode = normalizeRefreshMode(readFirstDefinedEnv(
+    ["REMODEX_REFRESH_MODE", "REMODEX_REFRESH_STRATEGY"],
+    DEFAULT_REFRESH_MODE,
+    env
+  ));
   const explicitRefreshEnabled = readOptionalBooleanEnv(["REMODEX_REFRESH_ENABLED"], env);
   // Desktop refresh is opt-in for now because Codex.app still lacks true live updates.
   const defaultRefreshEnabled = false;
+  const relayConfig = readRelayConfig({
+    env,
+    networkInterfaces,
+  });
   return {
-    relayUrl: readFirstDefinedEnv(
-      ["REMODEX_RELAY", "PHODEX_RELAY"],
-      "wss://api.phodex.app/relay",
-      env
-    ),
+    ...relayConfig,
     refreshEnabled: explicitRefreshEnabled == null
       ? defaultRefreshEnabled
       : explicitRefreshEnabled,
@@ -544,6 +596,7 @@ function readBridgeConfig({ env = process.env, platform = process.platform } = {
     ),
     codexEndpoint,
     refreshCommand,
+    refreshMode,
     codexBundleId: readFirstDefinedEnv(["REMODEX_CODEX_BUNDLE_ID"], DEFAULT_BUNDLE_ID, env),
     codexAppPath: DEFAULT_APP_PATH,
   };
@@ -670,6 +723,13 @@ function parseBooleanEnv(value) {
 function parseIntegerEnv(value, fallback) {
   const parsed = Number.parseInt(String(value), 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function normalizeRefreshMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["relaunch", "restart", "hard-reload", "hard_reload"].includes(normalized)
+    ? "relaunch"
+    : DEFAULT_REFRESH_MODE;
 }
 
 function extractErrorMessage(error) {

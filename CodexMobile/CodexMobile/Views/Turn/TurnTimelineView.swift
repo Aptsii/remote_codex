@@ -27,9 +27,13 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
     @Binding var shouldAnchorToAssistantResponse: Bool
     @Binding var isScrolledToBottom: Bool
 
+    let canLoadOlderHistoryRemotely: Bool
+    let isLoadingOlderHistory: Bool
     let onRetryUserMessage: (String) -> Void
     let onTapAssistantRevert: (CodexMessage) -> Void
+    let onTapSubagent: (CodexSubagentThreadPresentation) -> Void
     let onTapOutsideComposer: () -> Void
+    let onLoadOlderHistory: () -> Void
     @ViewBuilder let emptyState: () -> EmptyState
     @ViewBuilder let composer: () -> Composer
 
@@ -63,6 +67,10 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
         visibleTailCount < messages.count
     }
 
+    private var showsLoadEarlierButton: Bool {
+        hasEarlierMessages || canLoadOlderHistoryRemotely
+    }
+
     var body: some View {
         if messages.isEmpty {
             // Keep new/empty chats static to avoid scroll indicators and inert scrolling.
@@ -87,22 +95,37 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
                 ScrollView {
                     VStack(spacing: 0) {
                         LazyVStack(spacing: 20) {
-                            if hasEarlierMessages {
+                            if showsLoadEarlierButton {
                                 Button {
-                                    withAnimation(.easeOut(duration: 0.15)) {
-                                        visibleTailCount = min(
-                                            visibleTailCount + Self.pageSize,
-                                            messages.count
-                                        )
+                                    if hasEarlierMessages {
+                                        withAnimation(.easeOut(duration: 0.15)) {
+                                            visibleTailCount = min(
+                                                visibleTailCount + Self.pageSize,
+                                                messages.count
+                                            )
+                                        }
+                                    } else {
+                                        onLoadOlderHistory()
                                     }
                                 } label: {
-                                    Text("Load earlier messages")
-                                        .font(AppFont.subheadline())
-                                        .foregroundStyle(.secondary)
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 10)
+                                    Group {
+                                        if isLoadingOlderHistory {
+                                            HStack(spacing: 8) {
+                                                ProgressView()
+                                                    .controlSize(.small)
+                                                Text("Loading earlier messages...")
+                                            }
+                                        } else {
+                                            Text("Load earlier messages")
+                                        }
+                                    }
+                                    .font(AppFont.subheadline())
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
                                 }
                                 .buttonStyle(.plain)
+                                .disabled(isLoadingOlderHistory)
                             }
 
                             ForEach(visibleMessages) { message in
@@ -118,6 +141,7 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
                                 )
                                 .equatable()
                                 .environment(\.assistantRevertAction, onTapAssistantRevert)
+                                .environment(\.subagentOpenAction, onTapSubagent)
                                 .id(message.id)
                             }
                         }
@@ -268,7 +292,13 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
             hasher.combine(message.kind)
             hasher.combine(message.turnId)
             hasher.combine(message.isStreaming)
-            hasher.combine(message.text)
+            // During streaming, text changes every delta — hash only the length to avoid
+            // O(text_length) hashing per frame. Once finalized, hash full text for reconciliation.
+            if message.isStreaming {
+                hasher.combine(message.text.count)
+            } else {
+                hasher.combine(message.text)
+            }
         }
 
         return hasher.finalize()
@@ -364,6 +394,15 @@ struct TurnTimelineView<EmptyState: View, Composer: View>: View {
     // Stops follow-bottom as soon as the user drags away so queued snaps cannot fight the gesture.
     private func handleScrolledToBottomChanged(_ nextValue: Bool) {
         guard nextValue != isScrolledToBottom else { return }
+
+        // Ignore transient "not at bottom" geometry while a newly selected chat is still
+        // performing its initial recovery snap, otherwise fast chat switches can downgrade
+        // follow-bottom to manual before the first bottom jump lands.
+        if !nextValue,
+           initialRecoverySnapPendingThreadID == threadID,
+           autoScrollMode == .followBottom {
+            return
+        }
 
         if nextValue {
             isScrolledToBottom = true

@@ -20,6 +20,10 @@ struct TurnView: View {
     @State private var repositoryDiffPresentation: TurnDiffPresentation?
     @State private var assistantRevertSheetState: AssistantRevertSheetState?
     @State private var alertApprovalRequest: CodexApprovalRequest?
+    @State private var isShowingMacHandoffConfirm = false
+    @State private var macHandoffErrorMessage: String?
+    @State private var isHandingOffToMac = false
+    @State private var isLoadingOlderHistory = false
 
     // ─── ENTRY POINT ─────────────────────────────────────────────
     var body: some View {
@@ -31,78 +35,55 @@ struct TurnView: View {
         let showsGitControls = codex.isConnected && gitWorkingDirectory != nil
 
         return TurnConversationContainerView(
-            threadID: thread.id,
-            messages: renderSnapshot.messages,
-            timelineChangeToken: renderSnapshot.timelineChangeToken,
-            activeTurnID: activeTurnID,
-            isThreadRunning: isThreadRunning,
-            latestTurnTerminalState: renderSnapshot.latestTurnTerminalState,
-            stoppedTurnIDs: renderSnapshot.stoppedTurnIDs,
-            assistantRevertStatesByMessageID: renderSnapshot.assistantRevertStatesByMessageID,
-            errorMessage: codex.lastErrorMessage,
-            shouldAnchorToAssistantResponse: shouldAnchorToAssistantResponseBinding,
-            isScrolledToBottom: isScrolledToBottomBinding,
-            emptyState: AnyView(emptyState),
-            composer: AnyView(
-                TurnComposerHostView(
-                    viewModel: viewModel,
-                    codex: codex,
-                    thread: thread,
+                threadID: thread.id,
+                messages: renderSnapshot.messages,
+                timelineChangeToken: renderSnapshot.timelineChangeToken,
+                activeTurnID: activeTurnID,
+                isThreadRunning: isThreadRunning,
+                latestTurnTerminalState: renderSnapshot.latestTurnTerminalState,
+                stoppedTurnIDs: renderSnapshot.stoppedTurnIDs,
+                assistantRevertStatesByMessageID: renderSnapshot.assistantRevertStatesByMessageID,
+                errorMessage: codex.lastErrorMessage,
+                shouldAnchorToAssistantResponse: shouldAnchorToAssistantResponseBinding,
+                isScrolledToBottom: isScrolledToBottomBinding,
+                canLoadOlderHistoryRemotely: codex.isConnected
+                    && !codex.hasLoadedFullHistory(threadId: thread.id)
+                    && !renderSnapshot.messages.isEmpty,
+                isLoadingOlderHistory: isLoadingOlderHistory,
+                emptyState: AnyView(emptyState),
+                composer: AnyView(composerWithSubagentAccessory(
                     activeTurnID: activeTurnID,
                     isThreadRunning: isThreadRunning,
-                    isInputFocused: $isInputFocused,
-                    orderedModelOptions: orderedModelOptions,
-                    selectedModelTitle: selectedModelTitle,
-                    reasoningDisplayOptions: reasoningDisplayOptions,
-                    selectedReasoningTitle: selectedReasoningTitle,
                     showsGitControls: showsGitControls,
-                    isGitBranchSelectorEnabled: canRunGitAction(
-                        isThreadRunning: isThreadRunning,
-                        gitWorkingDirectory: gitWorkingDirectory
-                    ),
-                    onSelectGitBranch: { branch in
-                        guard canRunGitAction(
-                            isThreadRunning: isThreadRunning,
-                            gitWorkingDirectory: gitWorkingDirectory
-                        ) else { return }
-
-                        viewModel.switchGitBranch(
-                            to: branch,
-                            codex: codex,
-                            workingDirectory: gitWorkingDirectory,
-                            threadID: thread.id,
-                            activeTurnID: activeTurnID
-                        )
-                    },
-                    onRefreshGitBranches: {
-                        guard showsGitControls else { return }
-                        viewModel.refreshGitBranchTargets(
-                            codex: codex,
-                            workingDirectory: gitWorkingDirectory,
-                            threadID: thread.id
-                        )
-                    },
-                    onStartCodeReviewThread: startCodeReviewThread,
-                    onShowStatus: presentStatusSheet,
-                    onSend: handleSend
-                )
-            ),
-            repositoryLoadingToastOverlay: AnyView(EmptyView()),
-            usageToastOverlay: AnyView(EmptyView()),
-            isRepositoryLoadingToastVisible: false,
-            onRetryUserMessage: { messageText in
-                viewModel.input = messageText
-                isInputFocused = true
-            },
-            onTapAssistantRevert: { message in
-                startAssistantRevertPreview(message: message, gitWorkingDirectory: gitWorkingDirectory)
-            },
-            onTapOutsideComposer: {
-                guard isInputFocused else { return }
-                isInputFocused = false
-                viewModel.clearComposerAutocomplete()
-            }
-        )
+                    gitWorkingDirectory: gitWorkingDirectory
+                )),
+                repositoryLoadingToastOverlay: AnyView(EmptyView()),
+                usageToastOverlay: AnyView(EmptyView()),
+                isRepositoryLoadingToastVisible: false,
+                onRetryUserMessage: { messageText in
+                    viewModel.input = messageText
+                    isInputFocused = true
+                },
+                onTapAssistantRevert: { message in
+                    startAssistantRevertPreview(message: message, gitWorkingDirectory: gitWorkingDirectory)
+                },
+                onTapSubagent: { subagent in
+                    openThread(subagent.threadId)
+                },
+                onTapOutsideComposer: {
+                    guard isInputFocused else { return }
+                    isInputFocused = false
+                    viewModel.clearComposerAutocomplete()
+                },
+                onLoadOlderHistory: {
+                    guard !isLoadingOlderHistory else { return }
+                    isLoadingOlderHistory = true
+                    Task { @MainActor in
+                        await codex.loadFullThreadHistoryOnDemand(threadId: thread.id)
+                        isLoadingOlderHistory = false
+                    }
+                }
+            )
         .environment(\.inlineCommitAndPushAction, showsGitControls ? {
             viewModel.inlineCommitAndPush(
                 codex: codex,
@@ -116,6 +97,10 @@ struct TurnView: View {
             TurnToolbarContent(
                 displayTitle: thread.displayTitle,
                 navigationContext: threadNavigationContext,
+                showsMacHandoff: false,
+                isHandingOffToMac: false,
+                showsDesktopRefreshButton: codex.isConnected,
+                isRefreshingDesktopApp: viewModel.isRefreshingDesktopApp,
                 repoDiffTotals: viewModel.gitRepoSync?.repoDiffTotals,
                 isLoadingRepoDiff: isLoadingRepositoryDiff,
                 showsGitActions: showsGitControls,
@@ -126,6 +111,10 @@ struct TurnView: View {
                 isRunningGitAction: viewModel.isRunningGitAction,
                 showsDiscardRuntimeChangesAndSync: viewModel.shouldShowDiscardRuntimeChangesAndSync,
                 gitSyncState: viewModel.gitSyncState,
+                onTapMacHandoff: nil,
+                onRefreshDesktopApp: codex.isConnected ? {
+                    viewModel.refreshDesktopApp(codex: codex, threadID: thread.id)
+                } : nil,
                 onTapRepoDiff: showsGitControls ? {
                     presentRepositoryDiff(workingDirectory: gitWorkingDirectory)
                 } : nil,
@@ -243,6 +232,8 @@ struct TurnView: View {
             alertApprovalRequest: $alertApprovalRequest,
             isShowingNothingToCommitAlert: isShowingNothingToCommitAlertBinding,
             gitSyncAlert: gitSyncAlertBinding,
+            isShowingMacHandoffConfirm: $isShowingMacHandoffConfirm,
+            macHandoffErrorMessage: $macHandoffErrorMessage,
             onDeclineApproval: {
                 viewModel.decline(codex: codex)
             },
@@ -257,6 +248,9 @@ struct TurnView: View {
                     threadID: thread.id,
                     activeTurnID: codex.activeTurnID(for: thread.id)
                 )
+            },
+            onConfirmMacHandoff: {
+                continueOnMac()
             }
         )
     }
@@ -327,6 +321,21 @@ struct TurnView: View {
 
         Task {
             await codex.refreshRateLimits()
+        }
+    }
+
+    private func continueOnMac() {
+        guard !isHandingOffToMac else { return }
+        isHandingOffToMac = true
+
+        Task { @MainActor in
+            defer { isHandingOffToMac = false }
+
+            do {
+                try await codex.refreshDesktopApp(threadId: thread.id)
+            } catch {
+                macHandoffErrorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -564,14 +573,6 @@ struct TurnView: View {
         )
     }
 
-    private var selectedReasoningTitle: String {
-        guard let selectedReasoningEffort = codex.selectedReasoningEffortForSelectedModel() else {
-            return "Select reasoning"
-        }
-
-        return TurnComposerMetaMapper.reasoningTitle(for: selectedReasoningEffort)
-    }
-
     private var selectedModelTitle: String {
         guard let selectedModel = codex.selectedModelOption() else {
             return "Select model"
@@ -592,6 +593,14 @@ struct TurnView: View {
         return requestThreadID == thread.id ? request : nil
     }
 
+    private var parentThread: CodexThread? {
+        guard let parentThreadId = thread.parentThreadId else {
+            return nil
+        }
+
+        return codex.thread(for: parentThreadId)
+    }
+
     private var threadNavigationContext: TurnThreadNavigationContext? {
         guard let path = thread.normalizedProjectPath ?? thread.cwd,
               !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -604,6 +613,73 @@ struct TurnView: View {
             subtitle: fullPath,
             fullPath: fullPath
         )
+    }
+
+    private func composerWithSubagentAccessory(
+        activeTurnID: String?,
+        isThreadRunning: Bool,
+        showsGitControls: Bool,
+        gitWorkingDirectory: String?
+    ) -> some View {
+        VStack(spacing: 8) {
+            if let parentThread = parentThread {
+                SubagentParentAccessoryCard(
+                    parentTitle: parentThread.displayTitle,
+                    agentLabel: codex.resolvedSubagentDisplayLabel(threadId: thread.id, agentId: thread.agentId)
+                        ?? "Subagent",
+                    onTap: { openThread(parentThread.id) }
+                )
+                .padding(.horizontal, 12)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
+            TurnComposerHostView(
+                viewModel: viewModel,
+                codex: codex,
+                thread: thread,
+                activeTurnID: activeTurnID,
+                isThreadRunning: isThreadRunning,
+                isInputFocused: $isInputFocused,
+                orderedModelOptions: orderedModelOptions,
+                selectedModelTitle: selectedModelTitle,
+                reasoningDisplayOptions: reasoningDisplayOptions,
+                showsGitControls: showsGitControls,
+                isGitBranchSelectorEnabled: canRunGitAction(
+                    isThreadRunning: isThreadRunning,
+                    gitWorkingDirectory: gitWorkingDirectory
+                ),
+                onSelectGitBranch: { branch in
+                    guard canRunGitAction(
+                        isThreadRunning: isThreadRunning,
+                        gitWorkingDirectory: gitWorkingDirectory
+                    ) else { return }
+
+                    viewModel.switchGitBranch(
+                        to: branch,
+                        codex: codex,
+                        workingDirectory: gitWorkingDirectory,
+                        threadID: thread.id,
+                        activeTurnID: activeTurnID
+                    )
+                },
+                onRefreshGitBranches: {
+                    guard showsGitControls else { return }
+                    viewModel.refreshGitBranchTargets(
+                        codex: codex,
+                        workingDirectory: gitWorkingDirectory,
+                        threadID: thread.id
+                    )
+                },
+                onStartCodeReviewThread: startCodeReviewThread,
+                onShowStatus: presentStatusSheet,
+                onSend: handleSend
+            )
+        }
+    }
+
+    private func openThread(_ threadId: String) {
+        codex.activeThreadId = threadId
+        codex.markThreadAsViewed(threadId)
     }
 
     // MARK: - Empty State
@@ -627,6 +703,49 @@ struct TurnView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
+    }
+}
+
+private struct SubagentParentAccessoryCard: View {
+    let parentTitle: String
+    let agentLabel: String
+    let onTap: () -> Void
+
+    var body: some View {
+        GlassAccessoryCard(onTap: onTap) {
+            ZStack {
+                Circle()
+                    .fill(Color.accentColor.opacity(0.1))
+                    .frame(width: 22, height: 22)
+
+                Image(systemName: "arrow.turn.up.left")
+                    .font(AppFont.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+            }
+        } header: {
+            HStack(alignment: .center, spacing: 6) {
+                Text("Subagent")
+                    .font(AppFont.mono(.caption2))
+                    .foregroundStyle(.secondary)
+
+                Circle()
+                    .fill(Color(.separator).opacity(0.6))
+                    .frame(width: 3, height: 3)
+
+                SubagentLabelParser.styledText(for: agentLabel)
+                    .font(AppFont.caption(weight: .regular))
+                    .lineLimit(1)
+            }
+        } summary: {
+            Text("Back to \(parentTitle)")
+                .font(AppFont.subheadline(weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+        } trailing: {
+            Image(systemName: "chevron.right")
+                .font(AppFont.system(size: 11, weight: .semibold))
+                .foregroundStyle(.tertiary)
+        }
     }
 }
 

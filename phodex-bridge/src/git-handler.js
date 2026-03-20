@@ -132,10 +132,8 @@ async function gitStatus(cwd) {
 async function gitDiff(cwd) {
   const porcelain = await git(cwd, "status", "--porcelain=v1", "-b");
   const lines = porcelain.trim().split("\n").filter(Boolean);
-  const branchLine = lines[0] || "";
   const fileLines = lines.slice(1);
-  const tracking = parseTrackingFromStatus(branchLine);
-  const baseRef = await resolveRepoDiffBase(cwd, tracking);
+  const baseRef = await resolveWorkingTreeDiffBase(cwd);
   const trackedPatch = await gitDiffAgainstBase(cwd, baseRef);
   const untrackedPaths = fileLines
     .filter((line) => line.startsWith("?? "))
@@ -231,15 +229,19 @@ async function gitBranches(cwd) {
   const lines = output
     .trim()
     .split("\n")
-    .filter(Boolean)
-    .map((l) => l.trim());
+    .filter(Boolean);
 
   let current = "";
   const branchSet = new Set();
+  const branchesCheckedOutElsewhere = new Set();
 
   for (const line of lines) {
-    const isCurrent = line.startsWith("* ");
-    const name = line.replace(/^\*\s*/, "").trim();
+    const entry = normalizeBranchListEntry(line);
+    if (!entry) {
+      continue;
+    }
+
+    const { isCurrent, isCheckedOutElsewhere, name } = entry;
 
     if (name.includes("HEAD detached") || name === "(no branch)") {
       if (isCurrent) current = "HEAD";
@@ -253,6 +255,9 @@ async function gitBranches(cwd) {
       branchSet.add(name.replace("remotes/origin/", ""));
     } else {
       branchSet.add(name);
+      if (isCheckedOutElsewhere) {
+        branchesCheckedOutElsewhere.add(name);
+      }
     }
 
     if (isCurrent) current = name;
@@ -261,7 +266,12 @@ async function gitBranches(cwd) {
   const branches = [...branchSet].sort();
   const defaultBranch = await detectDefaultBranch(cwd, branches);
 
-  return { branches, current, default: defaultBranch };
+  return {
+    branches,
+    branchesCheckedOutElsewhere: [...branchesCheckedOutElsewhere].sort(),
+    current,
+    default: defaultBranch,
+  };
 }
 
 // ─── Git Checkout ─────────────────────────────────────────────
@@ -273,7 +283,7 @@ async function gitCheckout(cwd, params) {
   }
 
   try {
-    await git(cwd, "checkout", "--", branch);
+    await git(cwd, "checkout", branch);
   } catch (err) {
     if (err.message?.includes("would be overwritten")) {
       throw gitError(
@@ -281,11 +291,17 @@ async function gitCheckout(cwd, params) {
         "Cannot switch branches: you have uncommitted changes."
       );
     }
+    if (err.message?.includes("already used by worktree")) {
+      throw gitError(
+        "checkout_branch_in_other_worktree",
+        "Cannot switch branches: this branch is already open in another worktree."
+      );
+    }
     throw gitError("checkout_failed", err.message || "Checkout failed.");
   }
 
   const status = await gitStatus(cwd);
-  return { current: branch, tracking: status.tracking, status };
+  return { current: status.branch || branch, tracking: status.tracking, status };
 }
 
 // ─── Git Log ──────────────────────────────────────────────────
@@ -407,10 +423,28 @@ async function gitBranchesWithStatus(cwd) {
   return { ...branchResult, status: statusResult };
 }
 
-// Computes the local repo delta that still exists on this machine and is not on the remote.
+// Normalizes `git branch` output so the UI never sees worktree markers like `+ main`.
+function normalizeBranchListEntry(rawLine) {
+  const trimmed = typeof rawLine === "string" ? rawLine.trim() : "";
+  if (!trimmed) {
+    return null;
+  }
+
+  const isCurrent = trimmed.startsWith("* ");
+  const isCheckedOutElsewhere = trimmed.startsWith("+ ");
+  const name = trimmed.replace(/^[*+]\s+/, "").trim();
+
+  if (!name) {
+    return null;
+  }
+
+  return { isCurrent, isCheckedOutElsewhere, name };
+}
+
+// Computes the local Mac-style working tree delta shown in the desktop app:
+// unstaged tracked edits plus untracked files, excluding already staged changes.
 async function repoDiffTotals(cwd, context) {
-  const baseRef = await resolveRepoDiffBase(cwd, context.tracking);
-  const trackedTotals = await diffTotalsAgainstBase(cwd, baseRef);
+  const trackedTotals = await diffTotalsAgainstIndex(cwd);
   const untrackedPaths = context.fileLines
     .filter((line) => line.startsWith("?? "))
     .map((line) => line.substring(3).trim())
@@ -422,6 +456,19 @@ async function repoDiffTotals(cwd, context) {
     deletions: trackedTotals.deletions + untrackedTotals.deletions,
     binaryFiles: trackedTotals.binaryFiles + untrackedTotals.binaryFiles,
   };
+}
+
+async function diffTotalsAgainstIndex(cwd) {
+  const output = await git(cwd, "diff", "--numstat");
+  return parseNumstatTotals(output);
+}
+
+async function resolveWorkingTreeDiffBase(cwd) {
+  try {
+    return (await git(cwd, "rev-parse", "HEAD")).trim();
+  } catch {
+    return EMPTY_TREE_HASH;
+  }
 }
 
 // Uses upstream when available; otherwise falls back to commits not yet present on any remote.
@@ -669,4 +716,12 @@ async function resolveRepoRoot(cwd) {
   return repoRoot || null;
 }
 
-module.exports = { handleGitRequest, gitStatus };
+module.exports = {
+  handleGitRequest,
+  gitStatus,
+  __test: {
+    gitBranches,
+    gitCheckout,
+    normalizeBranchListEntry,
+  },
+};

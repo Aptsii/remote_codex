@@ -16,13 +16,14 @@ struct TurnComposerSendAvailability {
     let hasBlockingAttachmentState: Bool
     let hasReviewSelection: Bool
     let hasPendingReviewSelection: Bool
+    let hasSubagentsSelection: Bool
 
     // Evaluates whether sending is allowed for the current composer state.
     var isSendDisabled: Bool {
         isSending
             || !isConnected
             || hasPendingReviewSelection
-            || (trimmedInput.isEmpty && !hasReadyImages && !hasReviewSelection)
+            || (trimmedInput.isEmpty && !hasReadyImages && !hasReviewSelection && !hasSubagentsSelection)
             || hasBlockingAttachmentState
     }
 }
@@ -50,6 +51,8 @@ struct QueuedTurnDraft: Identifiable {
     let text: String
     let attachments: [CodexImageAttachment]
     let skillMentions: [CodexTurnSkillMention]
+    // Preserves special send semantics, such as plan mode, while a busy thread queues locally.
+    let collaborationMode: CodexCollaborationModeKind?
     let createdAt: Date
 }
 
@@ -72,6 +75,7 @@ final class TurnViewModel {
         let rawSkillMentions: [TurnComposerMentionedSkill]
         let rawAttachments: [TurnComposerImageAttachment]
         let rawReviewSelection: TurnComposerReviewSelection?
+        let rawSubagentsSelectionArmed: Bool
     }
 
     // Splits contiguous filename segments into search-friendly word chunks.
@@ -83,6 +87,7 @@ final class TurnViewModel {
     var isSending = false
     var isHandlingApproval = false
     var isPlanModeArmed = false
+    var isRefreshingDesktopApp = false
     var steeringDraftID: String?
     var shouldAnchorToAssistantResponse = false
     var isScrolledToBottom = true
@@ -93,6 +98,7 @@ final class TurnViewModel {
     var composerMentionedFiles: [TurnComposerMentionedFile] = []
     var composerMentionedSkills: [TurnComposerMentionedSkill] = []
     var composerReviewSelection: TurnComposerReviewSelection?
+    var isSubagentsSelectionArmed = false
     var fileAutocompleteItems: [CodexFuzzyFileMatch] = []
     var isFileAutocompleteVisible = false
     var isFileAutocompleteLoading = false
@@ -113,6 +119,7 @@ final class TurnViewModel {
     var selectedGitBaseBranch = ""
     var currentGitBranch = ""
     var availableGitBranchTargets: [String] = []
+    var gitBranchesCheckedOutElsewhere: Set<String> = []
     var gitDefaultBranch = ""
     var gitRepoSync: GitRepoSyncResult? = nil
     var gitSyncState: String? { gitRepoSync?.state }
@@ -217,7 +224,8 @@ final class TurnViewModel {
             trimmedInput: trimmedComposerInput,
             mentionedFileCount: composerMentionedFiles.count,
             mentionedSkillCount: composerMentionedSkills.count,
-            attachmentCount: composerAttachments.count
+            attachmentCount: composerAttachments.count,
+            hasSubagentsSelection: isSubagentsSelectionArmed
         )
     }
 
@@ -271,7 +279,8 @@ final class TurnViewModel {
             hasReadyImages: hasReadyImages,
             hasBlockingAttachmentState: hasBlockingAttachmentState,
             hasReviewSelection: hasComposerReviewSelection,
-            hasPendingReviewSelection: hasPendingComposerReviewSelection
+            hasPendingReviewSelection: hasPendingComposerReviewSelection,
+            hasSubagentsSelection: isSubagentsSelectionArmed
         ).isSendDisabled
     }
 
@@ -279,6 +288,7 @@ final class TurnViewModel {
         resetFileAutocompleteState()
         resetSkillAutocompleteState()
         resetSlashCommandState(clearPendingSelection: true, clearConfirmedSelection: true)
+        isSubagentsSelectionArmed = false
         input = ""
         composerAttachments.removeAll()
         composerMentionedFiles.removeAll()
@@ -287,6 +297,24 @@ final class TurnViewModel {
 
     func setPlanModeArmed(_ isArmed: Bool) {
         isPlanModeArmed = isArmed
+    }
+
+    func refreshDesktopApp(codex: CodexService, threadID: String) {
+        guard codex.isConnected, !isRefreshingDesktopApp else {
+            return
+        }
+
+        isRefreshingDesktopApp = true
+
+        Task { @MainActor [weak self] in
+            defer { self?.isRefreshingDesktopApp = false }
+
+            do {
+                try await codex.refreshDesktopApp(threadId: threadID)
+            } catch {
+                // Non-fatal: the toolbar button is a convenience refresh path.
+            }
+        }
     }
 
     func clearFileAutocomplete() {
@@ -574,15 +602,17 @@ final class TurnViewModel {
         slashCommandPanelState = .commands(query: token.query)
     }
 
-    // Turns the selected slash command into an inline composer flow instead of injecting plain text.
+    // Turns the selected slash command into the matching inline composer behavior.
     func onSelectSlashCommand(_ command: TurnComposerSlashCommand) {
-        removeTrailingSlashCommandTokenFromInputIfNeeded()
-
         switch command {
         case .codeReview:
+            removeTrailingSlashCommandTokenFromInputIfNeeded()
             armCodeReviewSelection(command: command, target: nil)
         case .status:
+            removeTrailingSlashCommandTokenFromInputIfNeeded()
             resetSlashCommandState(clearPendingSelection: true)
+        case .subagents:
+            armSubagentsSelection()
         }
     }
 
@@ -594,6 +624,11 @@ final class TurnViewModel {
     func clearComposerReviewSelection() {
         composerReviewSelection = nil
         resetSlashCommandState()
+    }
+
+    func clearSubagentsSelection() {
+        isSubagentsSelectionArmed = false
+        resetSlashCommandState(clearPendingSelection: true)
     }
 
     func removeMentionedFile(id: String) {
@@ -722,7 +757,7 @@ final class TurnViewModel {
         composerAttachments[index].state = state
     }
 
-    // Sends a composer payload, preferring turn/steer when a run is already active.
+    // Sends a composer payload, queueing follow-ups while the current run is still active.
     func sendTurn(codex: CodexService, threadID: String) {
         let payload = buildPayloadWithMentions()
         let attachments = readyComposerAttachments
@@ -748,6 +783,7 @@ final class TurnViewModel {
             text: payload,
             attachments: attachments,
             skillMentions: skillMentions,
+            collaborationMode: isPlanModeArmed ? .plan : nil,
             createdAt: Date()
         ) : nil
         let pendingSend = PendingTurnSend(
@@ -759,7 +795,8 @@ final class TurnViewModel {
             rawFileMentions: composerMentionedFiles,
             rawSkillMentions: composerMentionedSkills,
             rawAttachments: composerAttachments,
-            rawReviewSelection: reviewSelection
+            rawReviewSelection: reviewSelection,
+            rawSubagentsSelectionArmed: isSubagentsSelectionArmed
         )
         let threadBusy = isThreadBusy(codex: codex, threadID: threadID)
         let queuePaused = isQueuePaused(codex: codex, threadID: threadID)
@@ -772,6 +809,7 @@ final class TurnViewModel {
             if stillBusy {
                 await performBusyThreadSend(
                     pendingSend,
+                    queuedDraft: queuedDraft,
                     codex: codex,
                     threadID: threadID
                 )
@@ -815,7 +853,8 @@ final class TurnViewModel {
                     userInput: nextDraft.text,
                     threadId: threadID,
                     attachments: nextDraft.attachments,
-                    skillMentions: nextDraft.skillMentions
+                    skillMentions: nextDraft.skillMentions,
+                    collaborationMode: nextDraft.collaborationMode
                 )
             } catch {
                 shouldAnchorToAssistantResponse = false
@@ -861,7 +900,8 @@ final class TurnViewModel {
                         userInput: draft.text,
                         threadId: threadID,
                         attachments: draft.attachments,
-                        skillMentions: draft.skillMentions
+                        skillMentions: draft.skillMentions,
+                        collaborationMode: draft.collaborationMode
                     )
                     removeQueuedDraft(id: id, codex: codex, threadID: threadID)
                     return
@@ -877,7 +917,8 @@ final class TurnViewModel {
                     expectedTurnId: expectedTurnID,
                     attachments: draft.attachments,
                     skillMentions: draft.skillMentions,
-                    shouldAppendUserMessage: true
+                    shouldAppendUserMessage: true,
+                    collaborationMode: draft.collaborationMode
                 )
                 removeQueuedDraft(id: id, codex: codex, threadID: threadID)
             } catch {
@@ -984,6 +1025,10 @@ final class TurnViewModel {
     // Extracts only a final `/query` token so slash commands open from the same composer input.
     static func trailingSlashCommandToken(in text: String) -> TurnTrailingSlashCommandToken? {
         TurnComposerCommandLogic.trailingSlashCommandToken(in: text)
+    }
+
+    static func replacingTrailingSlashCommandToken(in text: String, with replacement: String) -> String? {
+        TurnComposerCommandLogic.replacingTrailingSlashCommandToken(in: text, with: replacement)
     }
 
     static func replacingTrailingFileAutocompleteToken(in text: String, with selectedPath: String) -> String? {
@@ -1373,9 +1418,10 @@ final class TurnViewModel {
         codex.activeTurnID(for: threadID) != nil || codex.runningThreadIDs.contains(threadID)
     }
 
-    // Reuses the active turn when possible so follow-up chat sends steer the current run instead of waiting in queue.
+    // Queues normal follow-ups while a run is active; explicit steer stays behind the queued-draft action.
     private func performBusyThreadSend(
         _ pendingSend: PendingTurnSend,
+        queuedDraft: QueuedTurnDraft?,
         codex: CodexService,
         threadID: String
     ) async {
@@ -1386,42 +1432,16 @@ final class TurnViewModel {
             return
         }
 
+        guard let queuedDraft else {
+            restoreComposerState(from: pendingSend)
+            shouldAnchorToAssistantResponse = false
+            return
+        }
+
         isPlanModeArmed = false
         shouldAnchorToAssistantResponse = true
+        appendQueuedDraft(queuedDraft, codex: codex, threadID: threadID)
         clearComposer()
-
-        do {
-            let expectedTurnID = try await resolveSteerExpectedTurnID(
-                codex: codex,
-                threadID: threadID
-            )
-
-            try await codex.steerTurn(
-                userInput: pendingSend.payload,
-                threadId: threadID,
-                expectedTurnId: expectedTurnID,
-                attachments: pendingSend.attachments,
-                skillMentions: pendingSend.skillMentions,
-                shouldAppendUserMessage: true
-            )
-        } catch {
-            let stillBusy = await refreshBusyStateIfNeeded(codex: codex, threadID: threadID, wasBusy: true)
-            if !stillBusy {
-                codex.removeLatestFailedUserMessage(
-                    threadId: threadID,
-                    matchingText: pendingSend.payload,
-                    matchingAttachments: pendingSend.attachments
-                )
-                await performTurnSend(pendingSend, codex: codex, threadID: threadID)
-                return
-            }
-
-            shouldAnchorToAssistantResponse = false
-            restoreComposerState(from: pendingSend)
-            if codex.lastErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
-                codex.lastErrorMessage = codex.userFacingTurnErrorMessage(from: error)
-            }
-        }
     }
 
     // Sends the prepared payload and restores the exact raw composer state if startTurn fails.
@@ -1470,6 +1490,7 @@ final class TurnViewModel {
         composerMentionedSkills = pendingSend.rawSkillMentions
         composerAttachments = pendingSend.rawAttachments
         composerReviewSelection = pendingSend.rawReviewSelection
+        isSubagentsSelectionArmed = pendingSend.rawSubagentsSelectionArmed
     }
 
     // Resolves the active turn id for manual steer without relying on async autoclosure operators.
@@ -1582,6 +1603,14 @@ final class TurnViewModel {
         slashCommandPanelState = (target == nil) ? .codeReviewTargets : .hidden
     }
 
+    // Arms the composer-level subagents chip without leaking a slash token into the draft.
+    private func armSubagentsSelection() {
+        removeTrailingSlashCommandTokenFromInputIfNeeded()
+        clearComposerReviewSelectionIfNeededForNonReviewContent()
+        isSubagentsSelectionArmed = true
+        resetSlashCommandState(clearPendingSelection: true)
+    }
+
     private func clearComposerReviewSelectionIfNeededForInput(_ text: String) {
         guard composerReviewSelection?.target != nil else {
             return
@@ -1611,26 +1640,43 @@ final class TurnViewModel {
         }
     }
 
+    // Prefixes the composer draft with the canned delegation prompt when the chip is armed.
+    static func applyingSubagentsSelection(to text: String, isSelected: Bool) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isSelected,
+              let cannedPrompt = TurnComposerSlashCommand.subagents.cannedPrompt else {
+            return trimmed
+        }
+
+        guard !trimmed.isEmpty else {
+            return cannedPrompt
+        }
+
+        return "\(cannedPrompt)\n\n\(trimmed)"
+    }
+
     // Replaces inline `@filename` with `@fullpath` for each mentioned file.
     private func buildPayloadWithMentions() -> String {
-        var text = trimmedComposerInput
-        guard !composerMentionedFiles.isEmpty else {
-            return text
+        var text = input
+
+        if !composerMentionedFiles.isEmpty {
+            let ambiguousKeys = Self.ambiguousFileNameAliasKeys(in: composerMentionedFiles)
+
+            for mention in composerMentionedFiles {
+                let collisionKey = Self.fileNameAliasCollisionKey(for: mention.fileName)
+                let allowFileNameAliases = collisionKey.map { !ambiguousKeys.contains($0) } ?? true
+                text = Self.replacingFileMentionAliases(
+                    in: text,
+                    with: mention,
+                    allowFileNameAliases: allowFileNameAliases
+                )
+            }
         }
 
-        let ambiguousKeys = Self.ambiguousFileNameAliasKeys(in: composerMentionedFiles)
-
-        for mention in composerMentionedFiles {
-            let collisionKey = Self.fileNameAliasCollisionKey(for: mention.fileName)
-            let allowFileNameAliases = collisionKey.map { !ambiguousKeys.contains($0) } ?? true
-            text = Self.replacingFileMentionAliases(
-                in: text,
-                with: mention,
-                allowFileNameAliases: allowFileNameAliases
-            )
-        }
-
-        return text
+        return Self.applyingSubagentsSelection(
+            to: text,
+            isSelected: isSubagentsSelectionArmed
+        )
     }
 
     // Reuses the git base-branch selector so review requests stay aligned with the visible compare target.
@@ -1834,6 +1880,7 @@ final class TurnViewModel {
             do {
                 let result = try await gitService.branchesWithStatus()
                 availableGitBranchTargets = result.branches
+                gitBranchesCheckedOutElsewhere = result.branchesCheckedOutElsewhere
                 if let current = result.currentBranch, !current.isEmpty {
                     currentGitBranch = current
                 }
@@ -1897,6 +1944,15 @@ final class TurnViewModel {
                   !codex.runningThreadIDs.contains(threadID),
                   !self.isRunningGitAction,
                   !self.isSwitchingGitBranch else { return }
+
+            if gitBranchesCheckedOutElsewhere.contains(branch) {
+                gitSyncAlert = TurnGitSyncAlert(
+                    title: "Branch Switch Failed",
+                    message: "Cannot switch branches: this branch is already open in another worktree.",
+                    action: .dismissOnly
+                )
+                return
+            }
 
             self.isSwitchingGitBranch = true
             defer { self.isSwitchingGitBranch = false }

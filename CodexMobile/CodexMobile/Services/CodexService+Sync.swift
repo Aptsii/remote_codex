@@ -17,12 +17,15 @@ extension CodexService {
         stopSyncLoop()
         debugSyncLog("sync loop start")
 
-        let listIntervalForegroundNs: UInt64 = 20_000_000_000
+        // Foreground polling is intentionally more aggressive so desktop-authored changes
+        // feel closer to live on iPhone even when Codex.app itself doesn't push updates.
+        let listIntervalForegroundNs: UInt64 = 10_000_000_000
         let listIntervalBackgroundNs: UInt64 = 75_000_000_000
-        let historyIntervalForegroundNs: UInt64 = 15_000_000_000
+        let historyIntervalForegroundNs: UInt64 = 3_000_000_000
+        let historyIntervalForegroundMirroredNs: UInt64 = 1_000_000_000
         let historyIntervalBackgroundIdleNs: UInt64 = 90_000_000_000
         let historyIntervalBackgroundRunningNs: UInt64 = 12_000_000_000
-        let watchIntervalForegroundNs: UInt64 = 4_000_000_000
+        let watchIntervalForegroundNs: UInt64 = 2_000_000_000
         let watchIntervalBackgroundNs: UInt64 = 15_000_000_000
 
         threadListSyncTask = Task { [weak self] in
@@ -38,10 +41,13 @@ extension CodexService {
             while let self, !Task.isCancelled {
                 if let threadId = self.activeThreadId {
                     let hasActiveOrRunningTurn = self.threadHasActiveOrRunningTurn(threadId)
+                    let wantsMirroredRunningCatchup = self.shouldPrioritizeMirroredRunningCatchup(threadId)
                     await self.syncActiveThreadState(threadId: threadId)
                     let interval: UInt64
                     if self.isAppInForeground {
-                        interval = historyIntervalForegroundNs
+                        interval = wantsMirroredRunningCatchup
+                            ? historyIntervalForegroundMirroredNs
+                            : historyIntervalForegroundNs
                     } else if hasActiveOrRunningTurn {
                         interval = historyIntervalBackgroundRunningNs
                     } else {
@@ -144,7 +150,7 @@ extension CodexService {
             return
         }
 
-        if threads.first(where: { $0.id == threadId })?.syncState == .archivedLocal {
+        if thread(for: threadId)?.syncState == .archivedLocal {
             return
         }
 
@@ -182,23 +188,13 @@ extension CodexService {
             var liveThread = serverThread
 
             if let localThread = localByID[liveThread.id] {
-                liveThread.syncState = localThread.syncState
-                if liveThread.title == nil { liveThread.title = localThread.title }
-                if liveThread.name == nil { liveThread.name = localThread.name }
-                if liveThread.preview == nil { liveThread.preview = localThread.preview }
-                if liveThread.createdAt == nil { liveThread.createdAt = localThread.createdAt }
-                if liveThread.updatedAt == nil { liveThread.updatedAt = localThread.updatedAt }
-                if liveThread.cwd == nil { liveThread.cwd = localThread.cwd }
-                liveThread.metadata = mergedThreadMetadata(
-                    serverMetadata: liveThread.metadata,
-                    localMetadata: localThread.metadata
-                )
-            } else if persistedArchivedIDs.contains(liveThread.id) {
-                liveThread.syncState = .archivedLocal
-            } else {
-                liveThread.syncState = .live
+                liveThread = mergedThread(liveThread, with: localThread)
             }
 
+            liveThread.syncState = .live
+            if persistedArchivedIDs.contains(liveThread.id) {
+                removeLocallyArchivedThreadID(liveThread.id)
+            }
             merged[liveThread.id] = liveThread
         }
 
@@ -212,20 +208,10 @@ extension CodexService {
             }
 
             var archivedThread = serverThread
-            archivedThread.syncState = .archivedLocal
-
             if let localThread = localByID[archivedThread.id] {
-                if archivedThread.title == nil { archivedThread.title = localThread.title }
-                if archivedThread.name == nil { archivedThread.name = localThread.name }
-                if archivedThread.preview == nil { archivedThread.preview = localThread.preview }
-                if archivedThread.createdAt == nil { archivedThread.createdAt = localThread.createdAt }
-                if archivedThread.updatedAt == nil { archivedThread.updatedAt = localThread.updatedAt }
-                if archivedThread.cwd == nil { archivedThread.cwd = localThread.cwd }
-                archivedThread.metadata = mergedThreadMetadata(
-                    serverMetadata: archivedThread.metadata,
-                    localMetadata: localThread.metadata
-                )
+                archivedThread = mergedThread(archivedThread, with: localThread)
             }
+            archivedThread.syncState = .archivedLocal
 
             // Persist the archived state so it survives future reconciliations.
             addLocallyArchivedThreadID(archivedThread.id)
@@ -245,10 +231,19 @@ extension CodexService {
         threads = sortThreads(Array(merged.values))
         assistantRevertStateCacheByThread.removeAll()
         refreshBusyRepoRootsAndDependentTimelineStates()
+        // Full reconciliation — always refresh all threads even if busy-roots already hit some.
         refreshAllThreadTimelineStates()
 
         if activeThreadId == nil {
-            activeThreadId = threads.first(where: { $0.syncState == .live })?.id
+            activeThreadId = firstLiveThreadID()
+        }
+
+        if pendingNotificationOpenThreadID != nil {
+            // A successful thread/list refresh gives us fresh server truth, so retry
+            // any deferred push deep-link without forcing another list round-trip.
+            Task { @MainActor [weak self] in
+                _ = await self?.routePendingNotificationOpenIfPossible(refreshIfNeeded: false)
+            }
         }
     }
 
@@ -256,7 +251,7 @@ extension CodexService {
         clearRunningState(for: threadId)
         clearOutcomeBadge(for: threadId)
 
-        if let index = threads.firstIndex(where: { $0.id == threadId }) {
+        if let index = threadIndex(for: threadId) {
             threads[index].syncState = .archivedLocal
         } else {
             threads.append(CodexThread(id: threadId, title: "Conversation", syncState: .archivedLocal))
@@ -264,6 +259,7 @@ extension CodexService {
         }
 
         hydratedThreadIDs.remove(threadId)
+        fullHistoryHydratedThreadIDs.remove(threadId)
         loadingThreadIDs.remove(threadId)
         resumedThreadIDs.remove(threadId)
         streamingSystemMessageByItemID = streamingSystemMessageByItemID.filter { key, _ in
@@ -298,59 +294,52 @@ extension CodexService {
     }
 
     func archiveThread(_ threadId: String) {
-        clearRunningState(for: threadId)
-        removeThreadTimelineState(for: threadId)
-        clearOutcomeBadge(for: threadId)
-
-        if let index = threads.firstIndex(where: { $0.id == threadId }) {
-            threads[index].syncState = .archivedLocal
+        let subtreeThreadIDs = collectSubtreeThreadIDs(for: threadId)
+        for subtreeThreadID in subtreeThreadIDs {
+            setThreadArchivedLocally(subtreeThreadID, isArchived: true)
         }
 
-        hydratedThreadIDs.remove(threadId)
-        resumedThreadIDs.remove(threadId)
-
-        if let turnId = activeTurnID(for: threadId) {
-            setActiveTurnID(nil, for: threadId)
-            threadIdByTurnID.removeValue(forKey: turnId)
-            if activeTurnId == turnId { activeTurnId = nil }
-        }
-        threadIdByTurnID = threadIdByTurnID.filter { $0.value != threadId }
-
-        addLocallyArchivedThreadID(threadId)
-        debugSyncLog("thread archived by user: \(threadId)")
+        debugSyncLog("thread archived by user: \(threadId) (cascaded \(max(0, subtreeThreadIDs.count - 1)) children)")
         sendThreadArchiveRPC(threadId: threadId, unarchive: false)
     }
 
     // Archives every active thread in a sidebar project group so the folder disappears from the live list.
     func archiveThreadGroup(threadIDs: [String]) -> [String] {
-        let uniqueThreadIDs = Array(Set(threadIDs)).sorted()
-        for threadID in uniqueThreadIDs {
+        let rootThreadIDs = collectRootThreadIDs(from: threadIDs)
+        for threadID in rootThreadIDs {
             archiveThread(threadID)
         }
 
-        debugSyncLog("thread group archived by user: count=\(uniqueThreadIDs.count)")
-        return uniqueThreadIDs
+        debugSyncLog("thread group archived by user: roots=\(rootThreadIDs.count)")
+        return rootThreadIDs
     }
 
     func unarchiveThread(_ threadId: String) {
-        if let index = threads.firstIndex(where: { $0.id == threadId }) {
-            threads[index].syncState = .live
+        let subtreeThreadIDs = collectSubtreeThreadIDs(for: threadId)
+        for subtreeThreadID in subtreeThreadIDs {
+            setThreadArchivedLocally(subtreeThreadID, isArchived: false)
         }
-        removeLocallyArchivedThreadID(threadId)
-        debugSyncLog("thread unarchived by user: \(threadId)")
+
+        debugSyncLog("thread unarchived by user: \(threadId) (cascaded \(max(0, subtreeThreadIDs.count - 1)) children)")
         sendThreadArchiveRPC(threadId: threadId, unarchive: true)
     }
 
     func deleteThread(_ threadId: String) {
-        // Single-thread delete stays optimistic locally, then best-effort archives remotely.
+        // Child threads still exist as standalone server conversations, so deleting a parent
+        // should archive descendants locally instead of permanently hiding them as deleted.
+        let descendants = collectDescendantThreadIDs(for: threadId)
+        for childId in descendants {
+            setThreadArchivedLocally(childId, isArchived: true)
+        }
+
         removeThreadLocally(threadId, persistAsDeleted: true)
-        debugSyncLog("thread deleted by user: \(threadId)")
+        debugSyncLog("thread deleted by user: \(threadId) (cascaded \(descendants.count) children)")
         sendThreadArchiveRPC(threadId: threadId, unarchive: false)
     }
 
     func renameThread(_ threadId: String, name: String) {
         // Optimistic local update.
-        if let index = threads.firstIndex(where: { $0.id == threadId }) {
+        if let index = threadIndex(for: threadId) {
             threads[index].name = name
             threads[index].title = name
         }
@@ -359,7 +348,7 @@ extension CodexService {
     }
 
     private func sendThreadNameSetRPC(threadId: String, name: String) {
-        guard isConnected, webSocketConnection != nil else { return }
+        guard isConnected, webSocketConnection != nil || webSocketTask != nil else { return }
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
@@ -379,25 +368,98 @@ extension CodexService {
 
     // Removes every thread in a sidebar group without issuing per-thread RPC mutations.
     func deleteLocalThreadGroup(threadIDs: [String]) -> [String] {
-        for threadID in threadIDs {
+        let rootThreadIDs = collectRootThreadIDs(from: threadIDs)
+        let subtreeThreadIDs = rootThreadIDs.flatMap { collectSubtreeThreadIDs(for: $0) }
+        for threadID in Array(Set(subtreeThreadIDs)).sorted() {
             removeThreadLocally(threadID, persistAsDeleted: true)
         }
 
-        debugSyncLog("thread group deleted locally: count=\(threadIDs.count)")
-        return threadIDs
+        debugSyncLog("thread group deleted locally: roots=\(rootThreadIDs.count)")
+        return rootThreadIDs
     }
 
-    // Centralizes local-only thread cleanup so repo-group deletion can reuse it safely.
-    private func removeThreadLocally(_ threadId: String, persistAsDeleted: Bool) {
+    /// BFS over `parentThreadId` links to collect all transitive child thread IDs.
+    /// Uses a visited set to guard against hypothetical circular references.
+    private func collectDescendantThreadIDs(for parentId: String) -> [String] {
+        var queue = [parentId]
+        var visited = Set<String>()
+        var descendants: [String] = []
+        while !queue.isEmpty {
+            let current = queue.removeFirst()
+            for thread in threads where thread.parentThreadId == current && !visited.contains(thread.id) {
+                visited.insert(thread.id)
+                descendants.append(thread.id)
+                queue.append(thread.id)
+            }
+        }
+        return descendants
+    }
+
+    // Applies archive state consistently across parent/child subtrees without duplicating row-state cleanup.
+    private func setThreadArchivedLocally(_ threadId: String, isArchived: Bool) {
         clearRunningState(for: threadId)
         removeThreadTimelineState(for: threadId)
         clearOutcomeBadge(for: threadId)
 
-        threads.removeAll { $0.id == threadId }
-        messagesByThread.removeValue(forKey: threadId)
-        messagePersistence.save(messagesByThread)
+        if let index = threadIndex(for: threadId) {
+            threads[index].syncState = isArchived ? .archivedLocal : .live
+        }
 
         hydratedThreadIDs.remove(threadId)
+        resumedThreadIDs.remove(threadId)
+
+        if let turnId = activeTurnID(for: threadId) {
+            setActiveTurnID(nil, for: threadId)
+            threadIdByTurnID.removeValue(forKey: turnId)
+            if activeTurnId == turnId { activeTurnId = nil }
+        }
+        threadIdByTurnID = threadIdByTurnID.filter { $0.value != threadId }
+
+        if isArchived {
+            addLocallyArchivedThreadID(threadId)
+        } else {
+            removeLocallyArchivedThreadID(threadId)
+        }
+    }
+
+    // Returns the root thread plus all descendants so subtree operations can stay deterministic.
+    private func collectSubtreeThreadIDs(for rootId: String) -> [String] {
+        [rootId] + collectDescendantThreadIDs(for: rootId)
+    }
+
+    // Filters project/group selections down to roots so subtree operations do not double-process descendants.
+    private func collectRootThreadIDs(from threadIDs: [String]) -> [String] {
+        let uniqueThreadIDs = Array(Set(threadIDs))
+        let threadIDSet = Set(uniqueThreadIDs)
+
+        return uniqueThreadIDs
+            .filter { threadId in
+                guard let parentThreadId = thread(for: threadId)?.parentThreadId else {
+                    return true
+                }
+                return !threadIDSet.contains(parentThreadId)
+            }
+            .sorted()
+    }
+
+    // Centralizes local-only thread cleanup so repo-group deletion can reuse it safely.
+    private func removeThreadLocally(_ threadId: String, persistAsDeleted: Bool, persistMessages: Bool = true) {
+        clearRunningState(for: threadId)
+        removeThreadTimelineState(for: threadId)
+        clearOutcomeBadge(for: threadId)
+
+        // Drop local-only runtime overrides once a chat is fully removed from the device.
+        clearThreadReasoningEffortOverride(for: threadId)
+        clearThreadServiceTierOverride(for: threadId)
+
+        threads.removeAll { $0.id == threadId }
+        messagesByThread.removeValue(forKey: threadId)
+        if persistMessages {
+            messagePersistence.save(messagesByThread)
+        }
+
+        hydratedThreadIDs.remove(threadId)
+        fullHistoryHydratedThreadIDs.remove(threadId)
         loadingThreadIDs.remove(threadId)
         resumedThreadIDs.remove(threadId)
         streamingSystemMessageByItemID = streamingSystemMessageByItemID.filter { key, _ in
@@ -421,6 +483,7 @@ extension CodexService {
 
     func clearHydrationCaches() {
         hydratedThreadIDs.removeAll()
+        fullHistoryHydratedThreadIDs.removeAll()
         loadingThreadIDs.removeAll()
     }
 
@@ -473,18 +536,132 @@ extension CodexService {
         syncRealtimeEnabled && isConnected && isInitialized
     }
 
+    // Prioritizes only desktop-mirrored runs that still lack authoritative assistant deltas.
+    func shouldPrioritizeMirroredRunningCatchup(_ threadId: String) -> Bool {
+        mirroredRunningCatchupThreadIDs.contains(threadId) && threadHasActiveOrRunningTurn(threadId)
+    }
+
+    // Grants one bounded catch-up slot so mirrored desktop runs can refresh via
+    // thread/resume without hammering the server every loop tick.
+    func takeMirroredRunningCatchupPermit(
+        for threadId: String,
+        minInterval: TimeInterval = 1.0,
+        now: Date = Date()
+    ) -> Bool {
+        guard shouldPrioritizeMirroredRunningCatchup(threadId) else {
+            return false
+        }
+
+        if let lastSyncAt = lastMirroredRunningCatchupAtByThread[threadId],
+           now.timeIntervalSince(lastSyncAt) < minInterval {
+            return false
+        }
+
+        lastMirroredRunningCatchupAtByThread[threadId] = now
+        return true
+    }
+
     // Polls the currently displayed thread even while it is running so missed socket events can recover.
     // If the live snapshot fails, fall back to a history refresh instead of trusting stale running state.
     func syncActiveThreadState(threadId: String) async {
+        let normalizedActiveThreadID = normalizedInterruptIdentifier(activeThreadId)
+        let normalizedThreadID = normalizedInterruptIdentifier(threadId)
+        let isDisplayedThread = normalizedThreadID != nil && normalizedThreadID == normalizedActiveThreadID
         let wasRunning = threadHasActiveOrRunningTurn(threadId)
+        let shouldRunMirroredCatchup = wasRunning && takeMirroredRunningCatchupPermit(for: threadId)
+        var didRunMirroredCatchup = false
+        let existingMessages = messagesByThread[threadId] ?? []
+        let isSubagentThread = thread(for: threadId)?.isSubagent ?? false
+
         if wasRunning {
             let didRefresh = await refreshInFlightTurnState(threadId: threadId)
-            guard !didRefresh || !threadHasActiveOrRunningTurn(threadId) else {
+            let isStillRunning = threadHasActiveOrRunningTurn(threadId)
+
+            if shouldRunMirroredCatchup && isStillRunning {
+                do {
+                    _ = try await ensureThreadResumed(threadId: threadId, force: true)
+                } catch {
+                    await syncThreadHistory(threadId: threadId, force: true)
+                }
+                didRunMirroredCatchup = true
+            }
+
+            guard !didRefresh || !isStillRunning else {
                 return
             }
         }
 
-        await syncThreadHistory(threadId: threadId, force: true)
+        // Tail-first reopen: keep inactive threads on their locally cached tail.
+        // A full history fetch remains explicit, and running threads still use
+        // resume snapshots to recover missed live output.
+        if !wasRunning
+            && !existingMessages.isEmpty
+            && !threadLikelyHasNewerRemoteTail(threadId)
+            && !isDisplayedThread {
+            return
+        }
+
+        // Tail-first sync for the currently displayed idle thread keeps the newest
+        // content flowing in without re-opening a heavyweight server resume path on
+        // every foreground poll. Older history stays explicit via on-demand load.
+        if isDisplayedThread && !wasRunning {
+            let didLoadTail = await loadThreadTailSnapshotIfAvailable(threadId: threadId)
+            if didLoadTail || !existingMessages.isEmpty {
+                return
+            }
+        }
+
+        // Idle subagent children should stay on the lightweight tail-read path.
+        // Using `thread/resume` here can still reopen with a large server-owned
+        // thread payload and drop the socket before the fallback gets a chance.
+        if isSubagentThread && !wasRunning {
+            let shouldLoadTail = existingMessages.isEmpty || threadLikelyHasNewerRemoteTail(threadId) || isDisplayedThread
+            if shouldLoadTail {
+                let didLoadTail = await loadThreadTailSnapshotIfAvailable(threadId: threadId)
+                if !didLoadTail && existingMessages.isEmpty {
+                    do {
+                        try await loadThreadHistoryIfNeeded(
+                            threadId: threadId,
+                            forceRefresh: true,
+                            markHydratedWhenNotMaterialized: false
+                        )
+                    } catch {
+                        debugSyncLog("subagent full history fallback failed thread=\(threadId): \(error.localizedDescription)")
+                    }
+                }
+            }
+            return
+        }
+
+        if !didRunMirroredCatchup {
+            do {
+                _ = try await ensureThreadResumed(threadId: threadId, force: true)
+            } catch {
+                if existingMessages.isEmpty {
+                    if isSubagentThread {
+                        let didLoadTail = await loadThreadTailSnapshotIfAvailable(threadId: threadId)
+                        if !didLoadTail {
+                            debugSyncLog("subagent tail load failed thread=\(threadId): \(error.localizedDescription)")
+                        }
+                    } else {
+                        await syncThreadHistory(threadId: threadId, force: true)
+                    }
+                } else {
+                    debugSyncLog("tail-first resume failed thread=\(threadId): \(error.localizedDescription)")
+                }
+                return
+            }
+
+            // First-time opens without any persisted/local tail still need one full
+            // history read so the timeline is not blank on a fresh install.
+            if (messagesByThread[threadId] ?? []).isEmpty {
+                if isSubagentThread {
+                    _ = await loadThreadTailSnapshotIfAvailable(threadId: threadId)
+                } else {
+                    await syncThreadHistory(threadId: threadId, force: true)
+                }
+            }
+        }
     }
 
     func refreshInactiveRunningBadgeThreads(limit: Int = 3) async {
@@ -570,7 +747,7 @@ extension CodexService {
     /// Best-effort server-side archive/unarchive. Failures are logged but never
     /// surface to the user or trigger reconnection side-effects.
     private func sendThreadArchiveRPC(threadId: String, unarchive: Bool) {
-        guard isConnected, webSocketConnection != nil else { return }
+        guard isConnected, webSocketConnection != nil || webSocketTask != nil else { return }
         let method = unarchive ? "thread/unarchive" : "thread/archive"
         Task { @MainActor [weak self] in
             guard let self else { return }

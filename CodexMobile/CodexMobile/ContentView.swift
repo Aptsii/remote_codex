@@ -18,8 +18,10 @@ struct ContentView: View {
     @State private var navigationPath = NavigationPath()
     @State private var showSettings = false
     @State private var isShowingManualScanner = false
+    @State private var scannerCanReturnToOnboarding = false
     @State private var isSearchActive = false
     @State private var isRetryingBridgeUpdate = false
+    @State private var isPreparingManualScanner = false
     @State private var threadCompletionBannerDismissTask: Task<Void, Never>?
     @AppStorage("codex.hasSeenOnboarding") private var hasSeenOnboarding = false
 
@@ -28,8 +30,11 @@ struct ContentView: View {
 
     var body: some View {
         rootContent
-            // Keep launch/foreground reconnect observers alive even while the QR scanner is visible.
+            // Only resume saved-pairing recovery after onboarding is done and the manual scanner is not in control.
             .task {
+                guard hasSeenOnboarding, !isShowingManualScanner else {
+                    return
+                }
                 await viewModel.attemptAutoConnectOnLaunchIfNeeded(codex: codex)
             }
             .onChange(of: showSettings) { _, show in
@@ -66,19 +71,26 @@ struct ContentView: View {
                 }
                 selectedThread = matchingThread
             }
+            .onChange(of: codex.isConnected) { _, isConnected in
+                guard isConnected else { return }
+                syncSelectedThread(with: codex.threads)
+            }
             .onChange(of: codex.threads) { _, threads in
                 syncSelectedThread(with: threads)
             }
             .onChange(of: scenePhase) { _, phase in
                 codex.setForegroundState(phase != .background)
                 if phase == .active {
+                    guard hasSeenOnboarding, !isShowingManualScanner else {
+                        return
+                    }
                     Task {
                         await viewModel.attemptAutoReconnectOnForegroundIfNeeded(codex: codex)
                     }
                 }
             }
             .onChange(of: codex.shouldAutoReconnectOnForeground) { _, shouldReconnect in
-                guard shouldReconnect, scenePhase == .active else {
+                guard shouldReconnect, scenePhase == .active, hasSeenOnboarding, !isShowingManualScanner else {
                     return
                 }
                 Task {
@@ -109,6 +121,23 @@ struct ContentView: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
             }
+            .alert(
+                "Chat Deleted",
+                isPresented: missingNotificationThreadAlertIsPresented,
+                presenting: codex.missingNotificationThreadPrompt
+            ) { _ in
+                Button("Not Now", role: .cancel) {
+                    codex.missingNotificationThreadPrompt = nil
+                }
+                Button("Start New Chat") {
+                    codex.missingNotificationThreadPrompt = nil
+                    Task {
+                        await startNewThreadFromMissingNotificationAlert()
+                    }
+                }
+            } message: { _ in
+                Text("This chat is no longer available. Start a new chat instead?")
+            }
             .overlay(alignment: .top) {
                 if let banner = codex.threadCompletionBanner {
                     ThreadCompletionBannerView(
@@ -132,27 +161,53 @@ struct ContentView: View {
     private var rootContent: some View {
         if !hasSeenOnboarding {
             OnboardingView {
-                withAnimation { hasSeenOnboarding = true }
+                finishOnboardingAndShowScanner()
             }
         } else if isShowingManualScanner && !codex.isConnected {
             qrScannerBody
-        } else if codex.isConnected || viewModel.isAttemptingAutoReconnect || shouldShowReconnectShell {
+        } else if codex.isConnected
+            || viewModel.isAttemptingAutoReconnect
+            || shouldShowReconnectShell
+            || isPreparingManualScanner {
             mainAppBody
         } else {
             qrScannerBody
         }
     }
 
-    private var qrScannerBody: some View {
-        QRScannerView { pairingPayload in
-            Task {
-                isShowingManualScanner = false
-                await viewModel.connectToRelay(
-                    pairingPayload: pairingPayload,
-                    codex: codex
-                )
-            }
+    private func finishOnboardingAndShowScanner() {
+        codex.shouldAutoReconnectOnForeground = false
+        codex.connectionRecoveryState = .idle
+        codex.lastErrorMessage = nil
+        withAnimation {
+            hasSeenOnboarding = true
+            isShowingManualScanner = true
+            scannerCanReturnToOnboarding = true
         }
+    }
+
+    // Gives the scanner a typed optional back action only during first-run onboarding.
+    private var scannerBackAction: (() -> Void)? {
+        guard scannerCanReturnToOnboarding else {
+            return nil
+        }
+        return { returnFromScannerToOnboarding() }
+    }
+
+    private var qrScannerBody: some View {
+        QRScannerView(
+            onBack: scannerBackAction,
+            onScan: { pairingPayload in
+                Task {
+                    isShowingManualScanner = false
+                    scannerCanReturnToOnboarding = false
+                    await viewModel.connectToRelay(
+                        pairingPayload: pairingPayload,
+                        codex: codex
+                    )
+                }
+            }
+        )
     }
 
     private var effectiveSidebarWidth: CGFloat {
@@ -185,6 +240,13 @@ struct ContentView: View {
             }
         }
         .gesture(edgeDragGesture)
+        .task(id: codex.isConnected) {
+            guard codex.isConnected else { return }
+            syncSelectedThread(with: codex.threads)
+            if selectedThread == nil, codex.threads.isEmpty {
+                await refreshInitialThreadsIfNeeded()
+            }
+        }
     }
 
     // MARK: - Layers
@@ -216,6 +278,7 @@ struct ContentView: View {
         } else {
             HomeEmptyStateView(
                 connectionPhase: homeConnectionPhase,
+                statusMessage: codex.lastErrorMessage,
                 securityLabel: codex.secureConnectionState.statusLabel,
                 onToggleConnection: {
                     Task {
@@ -225,14 +288,12 @@ struct ContentView: View {
             ) {
                 if homeConnectionPhase == .connecting || (codex.hasSavedRelaySession && !codex.isConnected) {
                     Button("Scan New QR Code") {
-                        Task {
-                            await viewModel.stopAutoReconnectForManualScan(codex: codex)
-                        }
-                        isShowingManualScanner = true
+                        presentManualScannerAfterStoppingReconnect()
                     }
                     .font(AppFont.subheadline(weight: .semibold))
                     .foregroundStyle(.primary)
                     .buttonStyle(.plain)
+                    .disabled(isPreparingManualScanner)
                 }
             }
             .toolbar {
@@ -331,9 +392,28 @@ struct ContentView: View {
         }
     }
 
-    // Shows the remembered pairing shell after app relaunch so the user can reconnect without rescanning.
+    private func refreshInitialThreadsIfNeeded() async {
+        guard codex.isConnected, !codex.isLoadingThreads else {
+            return
+        }
+
+        do {
+            try await codex.listThreads()
+            syncSelectedThread(with: codex.threads)
+        } catch {
+            // Keep the connected shell visible; CodexService stores any user-facing error.
+        }
+    }
+
+    // Shows the remembered pairing shell while a saved pairing can still be retried.
     private var shouldShowReconnectShell: Bool {
-        codex.hasSavedRelaySession && !isShowingManualScanner
+        codex.hasSavedRelaySession
+            && !isShowingManualScanner
+            && (codex.isConnecting
+                || viewModel.isAttemptingAutoReconnect
+                || codex.shouldAutoReconnectOnForeground
+                || isRetryingSavedPairing
+                || hasIdleSavedPairingRecovery)
     }
 
     // Keeps home status honest during reconnect loops while letting post-connect sync show separately.
@@ -342,6 +422,27 @@ struct ContentView: View {
             return .connecting
         }
         return codex.connectionPhase
+    }
+
+    private var isRetryingSavedPairing: Bool {
+        if case .retrying = codex.connectionRecoveryState {
+            return true
+        }
+        return false
+    }
+
+    // Keeps the reconnect CTA visible after retries stop, unless the pairing must be replaced.
+    private var hasIdleSavedPairingRecovery: Bool {
+        guard codex.hasSavedRelaySession,
+              !codex.isConnected,
+              codex.secureConnectionState != .rePairRequired else {
+            return false
+        }
+
+        return !codex.isConnecting
+            && !viewModel.isAttemptingAutoReconnect
+            && !codex.shouldAutoReconnectOnForeground
+            && !isRetryingSavedPairing
     }
 
     private func finishGesture(open: Bool) {
@@ -356,6 +457,17 @@ struct ContentView: View {
         Binding(
             get: { codex.bridgeUpdatePrompt },
             set: { codex.bridgeUpdatePrompt = $0 }
+        )
+    }
+
+    private var missingNotificationThreadAlertIsPresented: Binding<Bool> {
+        Binding(
+            get: { codex.missingNotificationThreadPrompt != nil },
+            set: { isPresented in
+                if !isPresented {
+                    codex.missingNotificationThreadPrompt = nil
+                }
+            }
         )
     }
 
@@ -379,12 +491,42 @@ struct ContentView: View {
     private func presentManualScannerForBridgeRecovery() {
         codex.bridgeUpdatePrompt = nil
         isRetryingBridgeUpdate = false
+        presentManualScannerAfterStoppingReconnect()
+    }
+
+    // Shows the QR scanner immediately and tears down any stale reconnect in the background.
+    private func presentManualScannerAfterStoppingReconnect() {
+        guard !isShowingManualScanner else {
+            return
+        }
+
+        scannerCanReturnToOnboarding = false
+        isShowingManualScanner = true
 
         Task {
             await viewModel.stopAutoReconnectForManualScan(codex: codex)
-            await MainActor.run {
-                isShowingManualScanner = true
-            }
+        }
+    }
+
+    // Lets first-run pairing step back into onboarding without changing later recovery flows.
+    private func returnFromScannerToOnboarding() {
+        codex.shouldAutoReconnectOnForeground = false
+        codex.connectionRecoveryState = .idle
+        codex.lastErrorMessage = nil
+
+        withAnimation {
+            isShowingManualScanner = false
+            scannerCanReturnToOnboarding = false
+            hasSeenOnboarding = false
+        }
+    }
+
+    private func startNewThreadFromMissingNotificationAlert() async {
+        do {
+            let thread = try await codex.startThread()
+            selectedThread = thread
+        } catch {
+            codex.lastErrorMessage = codex.userFacingTurnErrorMessage(from: error)
         }
     }
 
@@ -432,9 +574,24 @@ struct ContentView: View {
 
     // Keeps selected thread coherent with server list updates.
     private func syncSelectedThread(with threads: [CodexThread]) {
+        if let activeThreadId = codex.activeThreadId,
+           !threads.contains(where: { $0.id == activeThreadId }) {
+            if selectedThread?.id == activeThreadId {
+                return
+            }
+            codex.activeThreadId = nil
+        }
+
+        if let activeThreadId = codex.activeThreadId,
+           let activeThread = threads.first(where: { $0.id == activeThreadId }),
+           selectedThread?.id != activeThread.id {
+            selectedThread = activeThread
+            return
+        }
+
         if let selected = selectedThread,
            !threads.contains(where: { $0.id == selected.id }) {
-            if codex.activeThreadId == selected.id {
+            if codex.activeThreadId == selected.id || selected.isSubagent {
                 return
             }
             selectedThread = codex.pendingNotificationOpenThreadID == nil ? threads.first : nil

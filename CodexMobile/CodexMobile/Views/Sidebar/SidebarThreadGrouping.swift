@@ -85,37 +85,51 @@ enum SidebarThreadGrouping {
             return []
         }
 
+        let threadsByID = Dictionary(uniqueKeysWithValues: threads.map { ($0.id, $0) })
+
         return sortThreadsByRecentActivity(
             threads.filter { thread in
-                thread.syncState != .archivedLocal && projectGroupID(for: thread) == group.id
+                thread.syncState != .archivedLocal
+                    && projectGroupID(for: thread, threadsByID: threadsByID) == group.id
             }
         ).map(\.id)
     }
 
-    private static func makeProjectGroup(projectKey: String, threads: [CodexThread]) -> SidebarThreadGroup {
+    private static func makeProjectGroup(
+        projectKey: String,
+        threads: [CodexThread],
+        threadsByID: [String: CodexThread]
+    ) -> SidebarThreadGroup {
         let sortedThreads = sortThreadsByRecentActivity(threads)
-        let representativeThread = sortedThreads.first
+        let representativeThread = sortedThreads.first(where: {
+            effectiveProjectPath(for: $0, threadsByID: threadsByID) != nil
+        }) ?? sortedThreads.first
+        let representativePath = representativeThread.flatMap {
+            effectiveProjectPath(for: $0, threadsByID: threadsByID)
+        }
         let sortDate = representativeThread?.updatedAt ?? representativeThread?.createdAt ?? .distantPast
         return SidebarThreadGroup(
             id: "project:\(projectKey)",
-            label: representativeThread?.projectDisplayName ?? "No Project",
+            label: representativePath.map(projectDisplayName(for:)) ?? representativeThread?.projectDisplayName ?? "No Project",
             kind: .project,
             sortDate: sortDate,
-            projectPath: representativeThread?.normalizedProjectPath,
+            projectPath: representativePath,
             threads: sortedThreads
         )
     }
 
     // Keeps project-derived UI consistent by centralizing the live-thread → project bucket mapping.
     private static func makeProjectGroups(from threads: [CodexThread]) -> [SidebarThreadGroup] {
+        let threadsByID = Dictionary(uniqueKeysWithValues: threads.map { ($0.id, $0) })
         var liveThreadsByProject: [String: [CodexThread]] = [:]
 
         for thread in threads where thread.syncState != .archivedLocal {
-            liveThreadsByProject[thread.projectKey, default: []].append(thread)
+            let projectKey = effectiveProjectKey(for: thread, threadsByID: threadsByID)
+            liveThreadsByProject[projectKey, default: []].append(thread)
         }
 
         return liveThreadsByProject.map { projectKey, projectThreads in
-            makeProjectGroup(projectKey: projectKey, threads: projectThreads)
+            makeProjectGroup(projectKey: projectKey, threads: projectThreads, threadsByID: threadsByID)
         }
         .sorted { lhs, rhs in
             if lhs.sortDate != rhs.sortDate {
@@ -141,7 +155,40 @@ enum SidebarThreadGrouping {
         }
     }
 
-    private static func projectGroupID(for thread: CodexThread) -> String {
-        "project:\(thread.projectKey)"
+    private static func projectGroupID(for thread: CodexThread, threadsByID: [String: CodexThread]) -> String {
+        "project:\(effectiveProjectKey(for: thread, threadsByID: threadsByID))"
+    }
+
+    private static func effectiveProjectKey(for thread: CodexThread, threadsByID: [String: CodexThread]) -> String {
+        effectiveProjectPath(for: thread, threadsByID: threadsByID) ?? thread.projectKey
+    }
+
+    private static func effectiveProjectPath(
+        for thread: CodexThread,
+        threadsByID: [String: CodexThread],
+        visited: Set<String> = []
+    ) -> String? {
+        if let normalizedProjectPath = thread.normalizedProjectPath {
+            return normalizedProjectPath
+        }
+
+        guard let parentThreadID = thread.parentThreadId,
+              !visited.contains(parentThreadID),
+              let parentThread = threadsByID[parentThreadID] else {
+            return nil
+        }
+
+        var nextVisited = visited
+        nextVisited.insert(thread.id)
+        return effectiveProjectPath(for: parentThread, threadsByID: threadsByID, visited: nextVisited)
+    }
+
+    private static func projectDisplayName(for projectPath: String) -> String {
+        let lastComponent = (projectPath as NSString).lastPathComponent
+        if !lastComponent.isEmpty, lastComponent != "/" {
+            return lastComponent
+        }
+
+        return projectPath
     }
 }

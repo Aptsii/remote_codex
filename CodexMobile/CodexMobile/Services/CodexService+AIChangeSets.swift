@@ -153,6 +153,80 @@ extension CodexService {
         return changeSet
     }
 
+    // Returns the newest non-reverted change set for a thread, preferring finalized entries over in-flight ones.
+    func latestRelevantAIChangeSet(for threadId: String) -> AIChangeSet? {
+        let normalizedThreadId = normalizedIdentifier(threadId)
+        let candidates = aiChangeSetsByID.values.filter { changeSet in
+            guard changeSet.status != .reverted else { return false }
+            guard normalizedIdentifier(changeSet.threadId) == normalizedThreadId else { return false }
+            return !changeSet.fileChanges.isEmpty
+        }
+
+        guard !candidates.isEmpty else {
+            return nil
+        }
+
+        let finalizedCandidates = candidates.filter { $0.finalizedAt != nil || $0.status != .collecting }
+        let rankedCandidates = finalizedCandidates.isEmpty ? candidates : finalizedCandidates
+        return rankedCandidates.max { lhs, rhs in
+            let lhsDate = lhs.finalizedAt ?? lhs.createdAt
+            let rhsDate = rhs.finalizedAt ?? rhs.createdAt
+            if lhsDate != rhsDate {
+                return lhsDate < rhsDate
+            }
+            if lhs.createdAt != rhs.createdAt {
+                return lhs.createdAt < rhs.createdAt
+            }
+            return lhs.id < rhs.id
+        }
+    }
+
+    // Derives the sidebar totals from the single newest relevant change set for a thread.
+    func latestRelevantAIChangeSetDiffTotals(for threadId: String) -> TurnSessionDiffTotals? {
+        guard let changeSet = latestRelevantAIChangeSet(for: threadId) else {
+            return nil
+        }
+
+        let additions = changeSet.fileChanges.reduce(0) { $0 + $1.additions }
+        let deletions = changeSet.fileChanges.reduce(0) { $0 + $1.deletions }
+        let changedFileCount = Set(changeSet.fileChanges.map(\.path)).count
+
+        let totals = TurnSessionDiffTotals(
+            additions: additions,
+            deletions: deletions,
+            changedFileCount: changedFileCount,
+            distinctDiffCount: 1
+        )
+        return totals.hasChanges ? totals : nil
+    }
+
+    // Produces a lightweight cache token that changes whenever the newest relevant change set changes.
+    func latestRelevantAIChangeSetFingerprint(for threadId: String) -> Int {
+        guard let changeSet = latestRelevantAIChangeSet(for: threadId) else {
+            return 0
+        }
+
+        var hasher = Hasher()
+        hasher.combine(changeSet.id)
+        hasher.combine(changeSet.threadId)
+        hasher.combine(changeSet.turnId)
+        hasher.combine(changeSet.createdAt)
+        hasher.combine(changeSet.finalizedAt)
+        hasher.combine(changeSet.status.rawValue)
+        hasher.combine(changeSet.source.rawValue)
+        hasher.combine(changeSet.patchHash)
+        hasher.combine(changeSet.fileChanges.count)
+        for fileChange in changeSet.fileChanges.sorted(by: { $0.path < $1.path }) {
+            hasher.combine(fileChange.path)
+            hasher.combine(fileChange.kind.rawValue)
+            hasher.combine(fileChange.additions)
+            hasher.combine(fileChange.deletions)
+            hasher.combine(fileChange.isBinary)
+            hasher.combine(fileChange.isRenameOrModeOnly)
+        }
+        return hasher.finalize()
+    }
+
     // Asks the bridge to dry-run the reverse patch against the current working tree.
     func previewRevert(
         changeSet: AIChangeSet,
@@ -610,4 +684,5 @@ private extension CodexService {
         }
         return candidate.hasPrefix(root + "/")
     }
+
 }

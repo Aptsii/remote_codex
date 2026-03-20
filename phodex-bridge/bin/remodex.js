@@ -5,7 +5,10 @@
 // Exports: none
 // Depends on: ../src
 
+const { loadLocalEnvFiles } = require("../src/load-env");
 const { startBridge, openLastActiveThread, watchThreadRollout } = require("../src");
+
+loadLocalEnvFiles();
 
 const command = process.argv[2] || "up";
 

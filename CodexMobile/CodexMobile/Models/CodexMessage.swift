@@ -23,6 +23,7 @@ enum CodexMessageKind: String, Codable, Hashable, Sendable {
     case thinking
     case fileChange
     case commandExecution
+    case subagentAction
     case plan
     case userInputPrompt
 }
@@ -33,13 +34,14 @@ struct CodexMessage: Identifiable, Codable, Hashable, Sendable {
     let role: CodexMessageRole
     var kind: CodexMessageKind
     var text: String
-    let createdAt: Date
+    var createdAt: Date
     var turnId: String?
     var itemId: String?
     var isStreaming: Bool
     var deliveryState: CodexMessageDeliveryState
     var attachments: [CodexImageAttachment]
     var planState: CodexPlanState?
+    var subagentAction: CodexSubagentAction?
     var structuredUserInputRequest: CodexStructuredUserInputRequest?
 
     /// Monotonically increasing counter that preserves insertion order.
@@ -59,6 +61,7 @@ struct CodexMessage: Identifiable, Codable, Hashable, Sendable {
         deliveryState: CodexMessageDeliveryState = .confirmed,
         attachments: [CodexImageAttachment] = [],
         planState: CodexPlanState? = nil,
+        subagentAction: CodexSubagentAction? = nil,
         structuredUserInputRequest: CodexStructuredUserInputRequest? = nil,
         orderIndex: Int? = nil
     ) {
@@ -74,6 +77,7 @@ struct CodexMessage: Identifiable, Codable, Hashable, Sendable {
         self.deliveryState = deliveryState
         self.attachments = attachments
         self.planState = planState
+        self.subagentAction = subagentAction
         self.structuredUserInputRequest = structuredUserInputRequest
         self.orderIndex = orderIndex ?? CodexMessageOrderCounter.next()
     }
@@ -91,6 +95,7 @@ struct CodexMessage: Identifiable, Codable, Hashable, Sendable {
         case deliveryState
         case attachments
         case planState
+        case subagentAction
         case structuredUserInputRequest
         case orderIndex
     }
@@ -109,6 +114,7 @@ struct CodexMessage: Identifiable, Codable, Hashable, Sendable {
         deliveryState = try container.decodeIfPresent(CodexMessageDeliveryState.self, forKey: .deliveryState) ?? .confirmed
         attachments = try container.decodeIfPresent([CodexImageAttachment].self, forKey: .attachments) ?? []
         planState = try container.decodeIfPresent(CodexPlanState.self, forKey: .planState)
+        subagentAction = try container.decodeIfPresent(CodexSubagentAction.self, forKey: .subagentAction)
         structuredUserInputRequest = try container.decodeIfPresent(
             CodexStructuredUserInputRequest.self,
             forKey: .structuredUserInputRequest

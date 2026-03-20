@@ -9,6 +9,7 @@ import Foundation
 struct TurnSessionDiffTotals: Equatable {
     let additions: Int
     let deletions: Int
+    let changedFileCount: Int
     let distinctDiffCount: Int
 
     var hasChanges: Bool {
@@ -63,6 +64,7 @@ enum TurnSessionDiffSummaryCalculator {
     ) -> TurnSessionDiffTotals? {
         let relevantMessages = relevantMessages(in: messages, scope: scope)
         var seenKeys: Set<String> = []
+        var changedPaths: Set<String> = []
         var additions = 0
         var deletions = 0
         var distinctDiffCount = 0
@@ -83,12 +85,16 @@ enum TurnSessionDiffSummaryCalculator {
 
             additions += summary.entries.reduce(0) { $0 + $1.additions }
             deletions += summary.entries.reduce(0) { $0 + $1.deletions }
+            for entry in summary.entries {
+                changedPaths.insert(entry.path)
+            }
             distinctDiffCount += 1
         }
 
         let totals = TurnSessionDiffTotals(
             additions: additions,
             deletions: deletions,
+            changedFileCount: changedPaths.count,
             distinctDiffCount: distinctDiffCount
         )
         return totals.hasChanges ? totals : nil

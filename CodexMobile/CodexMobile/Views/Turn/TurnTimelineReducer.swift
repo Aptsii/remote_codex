@@ -19,7 +19,8 @@ enum TurnTimelineReducer {
         let reordered = enforceIntraTurnOrder(in: visibleMessages)
         let collapsedThinking = collapseConsecutiveThinkingMessages(in: reordered)
         let dedupedFileChanges = removeDuplicateFileChangeMessages(in: collapsedThinking)
-        let dedupedAssistant = removeDuplicateAssistantMessages(in: dedupedFileChanges)
+        let dedupedSubagentActions = removeDuplicateSubagentActionMessages(in: dedupedFileChanges)
+        let dedupedAssistant = removeDuplicateAssistantMessages(in: dedupedSubagentActions)
         return TurnTimelineProjection(messages: dedupedAssistant)
     }
 
@@ -36,7 +37,7 @@ enum TurnTimelineReducer {
         return messages.last(where: { $0.role == .assistant && $0.isStreaming })?.id
     }
 
-    // Ensures correct visual order within each turn: user → thinking → assistant → file changes.
+    // Ensures correct visual order within each turn: user → thinking → assistant/chat → commands → file changes.
     // Works on non-consecutive messages: collects ALL indices per turnId across the entire
     // array, sorts each turn's messages by role priority, and places them back into their
     // original slot positions. Messages without a turnId are never moved.
@@ -124,24 +125,26 @@ enum TurnTimelineReducer {
         switch message.role {
         case .user:
             return 0
+        case .assistant:
+            return 2
         case .system:
             switch message.kind {
             case .thinking:
                 return 1
-            case .commandExecution:
-                return 2
             case .chat:
                 return 3
             case .plan:
                 return 3
-            case .userInputPrompt:
-                return 6
+            case .commandExecution:
+                return 4
+            case .subagentAction:
+                return 5
             case .fileChange:
                 // Keep edited-file cards at the end of the turn timeline.
-                return 5
+                return 6
+            case .userInputPrompt:
+                return 7
             }
-        case .assistant:
-            return 4
         }
     }
 
@@ -292,33 +295,114 @@ enum TurnTimelineReducer {
 
     // Keeps only the newest matching file-change card when multiple event channels emit the same diff.
     static func removeDuplicateFileChangeMessages(in messages: [CodexMessage]) -> [CodexMessage] {
-        var latestIndexByKey: [String: Int] = [:]
-        for (index, message) in messages.enumerated() {
-            guard message.role == .system,
-                  message.kind == .fileChange,
-                  let key = duplicateFileChangeKey(for: message) else {
+        let signatures = messages.map { fileChangeDedupSignature(for: $0) }
+        var supersededIndices: Set<Int> = []
+
+        for olderIndex in messages.indices {
+            guard let olderSignature = signatures[olderIndex] else {
                 continue
             }
-            latestIndexByKey[key] = index
+
+            for newerIndex in messages.indices where newerIndex > olderIndex {
+                guard let newerSignature = signatures[newerIndex],
+                      fileChangeMessage(newerSignature, supersedes: olderSignature) else {
+                    continue
+                }
+                supersededIndices.insert(olderIndex)
+                break
+            }
         }
 
+        return messages.enumerated().compactMap { index, message in
+            if signatures[index] != nil, supersededIndices.contains(index) {
+                return nil
+            }
+            return message
+        }
+    }
+
+    // Collapses back-to-back subagent cards when the first one is only a transient
+    // placeholder and the second one carries the real child-thread payload.
+    static func removeDuplicateSubagentActionMessages(in messages: [CodexMessage]) -> [CodexMessage] {
         var result: [CodexMessage] = []
         result.reserveCapacity(messages.count)
 
-        for (index, message) in messages.enumerated() {
-            guard message.role == .system,
-                  message.kind == .fileChange,
-                  let key = duplicateFileChangeKey(for: message) else {
+        for message in messages {
+            guard let action = message.subagentAction,
+                  message.role == .system,
+                  message.kind == .subagentAction else {
                 result.append(message)
                 continue
             }
 
-            if latestIndexByKey[key] == index {
+            guard let previous = result.last,
+                  let previousAction = previous.subagentAction,
+                  shouldMergeSubagentActionMessages(
+                      previous: previous,
+                      previousAction: previousAction,
+                      incoming: message,
+                      incomingAction: action
+                  ) else {
                 result.append(message)
+                continue
             }
+
+            result[result.count - 1] = preferredSubagentActionMessage(previous: previous, incoming: message)
         }
 
         return result
+    }
+
+    private static func shouldMergeSubagentActionMessages(
+        previous: CodexMessage,
+        previousAction: CodexSubagentAction,
+        incoming: CodexMessage,
+        incomingAction: CodexSubagentAction
+    ) -> Bool {
+        guard previous.role == .system,
+              previous.kind == .subagentAction,
+              previous.threadId == incoming.threadId,
+              normalizedIdentifier(previous.turnId) == normalizedIdentifier(incoming.turnId),
+              previousAction.normalizedTool == incomingAction.normalizedTool,
+              previous.text == incoming.text else {
+            return false
+        }
+
+        guard let previousItemId = normalizedIdentifier(previous.itemId),
+              let incomingItemId = normalizedIdentifier(incoming.itemId) else {
+            return false
+        }
+        if previousItemId != incomingItemId {
+            return false
+        }
+
+        let previousRows = previousAction.agentRows
+        let incomingRows = incomingAction.agentRows
+
+        if previousRows.isEmpty && !incomingRows.isEmpty {
+            return true
+        }
+
+        if previousRows == incomingRows {
+            return true
+        }
+
+        return false
+    }
+
+    private static func preferredSubagentActionMessage(previous: CodexMessage, incoming: CodexMessage) -> CodexMessage {
+        let previousRows = previous.subagentAction?.agentRows ?? []
+        let incomingRows = incoming.subagentAction?.agentRows ?? []
+
+        if previousRows.isEmpty && !incomingRows.isEmpty {
+            return incoming
+        }
+
+        if incoming.isStreaming != previous.isStreaming {
+            return incoming.isStreaming ? previous : incoming
+        }
+
+        return incoming.orderIndex >= previous.orderIndex ? incoming : previous
     }
 
     // Keys file-change cards by turn + rendered payload so repeated turn/diff snapshots collapse to one row.
@@ -337,4 +421,59 @@ enum TurnTimelineReducer {
         }
         return "\(turnId)|\(normalizedText)"
     }
+
+    // Captures the parts of a file-change row that matter for timeline dedupe.
+    private static func fileChangeDedupSignature(for message: CodexMessage) -> FileChangeDedupSignature? {
+        guard message.role == .system,
+              message.kind == .fileChange,
+              let turnId = normalizedIdentifier(message.turnId),
+              let key = duplicateFileChangeKey(for: message) else {
+            return nil
+        }
+
+        let paths = Set(
+            TurnFileChangeSummaryParser.parse(from: message.text)?
+                .entries
+                .map(\.path) ?? []
+        )
+
+        return FileChangeDedupSignature(
+            turnId: turnId,
+            key: key,
+            paths: paths,
+            isStreaming: message.isStreaming
+        )
+    }
+
+    // Treats newer file-change snapshots as authoritative only when they describe the
+    // same turn and either the same dedupe key or a provisional-to-final snapshot upgrade.
+    private static func fileChangeMessage(
+        _ newer: FileChangeDedupSignature,
+        supersedes older: FileChangeDedupSignature
+    ) -> Bool {
+        guard newer.turnId == older.turnId else {
+            return false
+        }
+
+        if newer.key == older.key {
+            return true
+        }
+
+        guard !newer.paths.isEmpty, !older.paths.isEmpty else {
+            return false
+        }
+
+        if older.isStreaming && !newer.isStreaming && newer.paths == older.paths {
+            return true
+        }
+
+        return false
+    }
+}
+
+private struct FileChangeDedupSignature {
+    let turnId: String
+    let key: String
+    let paths: Set<String>
+    let isStreaming: Bool
 }

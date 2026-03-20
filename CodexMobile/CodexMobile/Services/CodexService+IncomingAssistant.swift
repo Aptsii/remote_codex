@@ -49,6 +49,32 @@ extension CodexService {
         )
     }
 
+    // Mirrors a user message coming from a desktop-origin rollout so reopened
+    // threads can show the prompt before the next history reconciliation.
+    func appendMirroredUserMessage(from paramsObject: IncomingParamsObject?) {
+        guard let paramsObject else { return }
+        let turnId = extractTurnID(from: paramsObject)
+        guard let threadId = resolveThreadID(from: paramsObject, turnIdHint: turnId) else {
+            return
+        }
+        if let turnId {
+            threadIdByTurnID[turnId] = threadId
+        }
+
+        let text = firstNonEmptyString([
+            paramsObject["message"]?.stringValue,
+            paramsObject["text"]?.stringValue,
+        ])
+        guard let text else { return }
+
+        markMirroredRunningCatchupNeeded(for: threadId)
+        appendConfirmedMirroredUserMessage(
+            threadId: threadId,
+            turnId: turnId,
+            text: text
+        )
+    }
+
     // Finalizes assistant text when item completion carries canonical content.
     func appendCompletedAgentText(from paramsObject: IncomingParamsObject?) {
         guard let paramsObject else { return }

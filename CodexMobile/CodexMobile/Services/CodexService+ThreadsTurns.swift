@@ -28,23 +28,53 @@ extension CodexService {
         reconcileLocalThreadsWithServer(activeThreads, serverArchivedThreads: archivedThreads)
 
         if activeThreadId == nil {
-            activeThreadId = threads.first(where: { $0.syncState == .live })?.id
+            activeThreadId = firstLiveThreadID()
         }
     }
 
-    // Starts a new thread and stores it in local state.
+    // Preserves the older startThread symbol used by most call sites and incremental builds.
     func startThread(
         preferredProjectPath: String? = nil,
-        pendingComposerAction: CodexPendingThreadComposerAction? = nil
+        runtimeOverride: CodexThreadRuntimeOverride? = nil
+    ) async throws -> CodexThread {
+        try await startThreadImpl(
+            preferredProjectPath: preferredProjectPath,
+            pendingComposerAction: nil,
+            runtimeOverride: runtimeOverride
+        )
+    }
+
+    // Starts a new thread and seeds a one-shot composer action for the destination thread.
+    func startThread(
+        preferredProjectPath: String? = nil,
+        pendingComposerAction: CodexPendingThreadComposerAction,
+        runtimeOverride: CodexThreadRuntimeOverride? = nil
+    ) async throws -> CodexThread {
+        try await startThreadImpl(
+            preferredProjectPath: preferredProjectPath,
+            pendingComposerAction: pendingComposerAction,
+            runtimeOverride: runtimeOverride
+        )
+    }
+
+    // Starts a new thread and stores it in local state.
+    private func startThreadImpl(
+        preferredProjectPath: String? = nil,
+        pendingComposerAction: CodexPendingThreadComposerAction? = nil,
+        runtimeOverride: CodexThreadRuntimeOverride? = nil
     ) async throws -> CodexThread {
         let normalizedPreferredProjectPath = CodexThreadStartProjectBinding.normalizedProjectPath(preferredProjectPath)
-        var includesServiceTier = runtimeServiceTierForTurn() != nil
+        // Brand-new chats start from app defaults; per-chat overrides are inherited only on continuation.
+        let explicitServiceTier = runtimeOverride?.overridesServiceTier == true
+            ? runtimeOverride?.serviceTierRawValue
+            : runtimeServiceTierForTurn()
+        var includesServiceTier = explicitServiceTier != nil
 
         while true {
             let params = CodexThreadStartProjectBinding.makeThreadStartParams(
                 modelIdentifier: runtimeModelIdentifierForTurn(),
                 preferredProjectPath: normalizedPreferredProjectPath,
-                serviceTier: includesServiceTier ? runtimeServiceTierForTurn() : nil
+                serviceTier: includesServiceTier ? explicitServiceTier : nil
             )
 
             do {
@@ -63,6 +93,9 @@ extension CodexService {
                 )
                 if let pendingComposerAction {
                     queuePendingComposerAction(pendingComposerAction, for: thread.id)
+                }
+                if let runtimeOverride, !runtimeOverride.isEmpty {
+                    applyThreadRuntimeOverride(runtimeOverride, to: thread.id)
                 }
                 upsertThread(thread)
                 resumedThreadIDs.insert(thread.id)
@@ -180,7 +213,18 @@ extension CodexService {
         }
         if normalizedTurnID == nil,
            let normalizedThreadID {
-            normalizedTurnID = try await resolveInFlightTurnID(threadId: normalizedThreadID)
+            do {
+                normalizedTurnID = try await resolveInFlightTurnID(threadId: normalizedThreadID)
+            } catch {
+                if let serviceError = error as? CodexServiceError,
+                   case .invalidInput(_) = serviceError,
+                   protectedRunningFallbackThreadIDs.contains(normalizedThreadID),
+                   activeTurnID(for: normalizedThreadID) == nil {
+                    demoteVisibleRunningStateToProtectedFallback(for: normalizedThreadID)
+                }
+                lastErrorMessage = userFacingTurnErrorMessage(from: error)
+                throw error
+            }
         }
 
         guard let normalizedTurnID else {
@@ -460,17 +504,48 @@ enum CodexThreadStartProjectBinding {
 
 extension CodexService {
     func fetchServerThreads(limit: Int? = nil, archived: Bool = false) async throws -> [CodexThread] {
+        let filteredThreads = try await fetchServerThreads(
+            limit: limit,
+            archived: archived,
+            includeExplicitSourceKinds: true
+        )
+
+        let unfilteredThreads: [CodexThread]
+        do {
+            unfilteredThreads = try await fetchServerThreads(
+                limit: limit,
+                archived: archived,
+                includeExplicitSourceKinds: false
+            )
+        } catch {
+            guard filteredThreads.isEmpty else {
+                debugSyncLog("thread/list unfiltered fetch failed (using filtered result): \(error.localizedDescription)")
+                return filteredThreads
+            }
+            throw error
+        }
+
+        return mergeFetchedServerThreads(primary: filteredThreads, secondary: unfilteredThreads)
+    }
+
+    private func fetchServerThreads(
+        limit: Int? = nil,
+        archived: Bool = false,
+        includeExplicitSourceKinds: Bool
+    ) async throws -> [CodexThread] {
         var allThreads: [CodexThread] = []
         var nextCursor: JSONValue = .null
         var hasRequestedFirstPage = false
 
         repeat {
             var params: RPCObject = [
-                // Avoid the server's narrower default sourceKinds so multi-project history
-                // includes threads started from the app-server flow as well.
-                "sourceKinds": .array(threadListSourceKinds.map(JSONValue.string)),
                 "cursor": nextCursor,
             ]
+            if includeExplicitSourceKinds {
+                // Prefer broad source coverage, but allow a no-filter fallback when
+                // a server/runtime rejects or narrows this list too aggressively.
+                params["sourceKinds"] = .array(threadListSourceKinds.map(JSONValue.string))
+            }
             if let limit {
                 params["limit"] = .integer(limit)
             }
@@ -502,6 +577,27 @@ extension CodexService {
         )
 
         return allThreads
+    }
+
+    private func mergeFetchedServerThreads(primary: [CodexThread], secondary: [CodexThread]) -> [CodexThread] {
+        guard !primary.isEmpty else {
+            return secondary
+        }
+        guard !secondary.isEmpty else {
+            return primary
+        }
+
+        var mergedByID: [String: CodexThread] = [:]
+        var orderedIDs: [String] = []
+
+        for thread in primary + secondary {
+            if mergedByID[thread.id] == nil {
+                orderedIDs.append(thread.id)
+            }
+            mergedByID[thread.id] = mergedThread(thread, with: mergedByID[thread.id])
+        }
+
+        return orderedIDs.compactMap { mergedByID[$0] }
     }
 
     // Requests all user-facing thread sources instead of relying on the server default.
@@ -547,7 +643,8 @@ extension CodexService {
     }
 
     func createContinuationThread(from archivedThreadId: String) async throws -> CodexThread {
-        let continuationThread = try await startThread()
+        let continuationRuntimeOverride = threadRuntimeOverride(for: archivedThreadId)
+        let continuationThread = try await startThread(runtimeOverride: continuationRuntimeOverride)
         appendSystemMessage(
             threadId: continuationThread.id,
             text: "Continued from archived thread `\(archivedThreadId)`"
@@ -562,12 +659,15 @@ extension CodexService {
         }
 
         if !force, resumedThreadIDs.contains(threadId) {
-            return threads.first(where: { $0.id == threadId })
+            return thread(for: threadId)
         }
 
         var params: RPCObject = [
             "threadId": .string(threadId),
         ]
+        if let workingDirectory = thread(for: threadId)?.gitWorkingDirectory {
+            params["cwd"] = .string(workingDirectory)
+        }
         if let modelIdentifier = runtimeModelIdentifierForTurn() {
             params["model"] = .string(modelIdentifier)
         }
@@ -587,6 +687,7 @@ extension CodexService {
 
             if let threadObject = threadValue.objectValue {
                 let historyMessages = decodeMessagesFromThreadRead(threadId: threadId, threadObject: threadObject)
+                registerSubagentThreads(from: historyMessages, parentThreadId: threadId)
                 if !historyMessages.isEmpty {
                     let existingMessages = messagesByThread[threadId] ?? []
                     let activeThreadIDs = Set(activeTurnIdByThread.keys)
@@ -594,15 +695,18 @@ extension CodexService {
                     let merged = await Task.detached {
                         Self.mergeHistoryMessages(existingMessages, historyMessages, activeThreadIDs: activeThreadIDs, runningThreadIDs: runningIDs)
                     }.value
-                    // If a turn started while merging, keep live streaming data.
-                    if !threadHasActiveOrRunningTurn(threadId) || existingMessages.isEmpty {
+                    // Forced resumes are used when reopening a running thread, so merge the
+                    // latest snapshot even mid-run and let mergeHistoryMessages preserve
+                    // existing streaming rows instead of waiting for the final block.
+                    if (force || !threadHasActiveOrRunningTurn(threadId) || existingMessages.isEmpty)
+                        && merged != existingMessages {
                         messagesByThread[threadId] = merged
                         persistMessages()
                         updateCurrentOutput(for: threadId)
                     }
                 }
             }
-        } else if let index = threads.firstIndex(where: { $0.id == threadId }) {
+        } else if let index = threadIndex(for: threadId) {
             threads[index].syncState = .live
         }
 
@@ -689,7 +793,7 @@ extension CodexService {
         var imageURLKey = "url"
         var effectiveCollaborationMode = supportsTurnCollaborationMode ? collaborationMode : nil
         var didDowngradePlanModeForRuntime = false
-        var includesServiceTier = runtimeServiceTierForTurn() != nil
+        var includesServiceTier = runtimeServiceTierForTurn(threadId: threadId) != nil
 
         while true {
             do {
@@ -765,7 +869,8 @@ extension CodexService {
         expectedTurnId: String?,
         attachments: [CodexImageAttachment] = [],
         skillMentions: [CodexTurnSkillMention] = [],
-        shouldAppendUserMessage: Bool = true
+        shouldAppendUserMessage: Bool = true,
+        collaborationMode: CodexCollaborationModeKind? = nil
     ) async throws {
         let normalizedThreadID = normalizedInterruptIdentifier(threadId) ?? threadId
         let pendingMessageId = shouldAppendUserMessage
@@ -789,11 +894,12 @@ extension CodexService {
 
         var includeStructuredSkillItems = supportsStructuredSkillInput && !skillMentions.isEmpty
         var imageURLKey = "url"
+        var effectiveCollaborationMode = supportsTurnCollaborationMode ? collaborationMode : nil
         var currentExpectedTurnID = initialTurnID
         var didRetryWithRefreshedTurnID = false
 
         while true {
-            let params: RPCObject = [
+            var params: RPCObject = [
                 "threadId": .string(normalizedThreadID),
                 "expectedTurnId": .string(currentExpectedTurnID),
                 "input": .array(
@@ -806,6 +912,12 @@ extension CodexService {
                     )
                 ),
             ]
+            if let collaborationModePayload = try buildCollaborationModePayload(
+                for: effectiveCollaborationMode,
+                threadId: normalizedThreadID
+            ) {
+                params["collaborationMode"] = collaborationModePayload
+            }
 
             do {
                 let response = try await sendRequest(method: "turn/steer", params: .object(params))
@@ -834,6 +946,14 @@ extension CodexService {
                    !attachments.isEmpty,
                    shouldRetryTurnStartWithImageURLField(error) {
                     imageURLKey = "image_url"
+                    continue
+                }
+
+                if effectiveCollaborationMode != nil,
+                   shouldRetryTurnStartWithoutCollaborationMode(error) {
+                    // Keep steer compatible with runtimes that only support plain turns.
+                    supportsTurnCollaborationMode = false
+                    effectiveCollaborationMode = nil
                     continue
                 }
 
@@ -968,21 +1088,27 @@ extension CodexService {
         if let modelIdentifier = runtimeModelIdentifierForTurn() {
             params["model"] = .string(modelIdentifier)
         }
-        if let effort = selectedReasoningEffortForSelectedModel() {
+        if let effort = selectedReasoningEffortForSelectedModel(threadId: threadId) {
             params["effort"] = .string(effort)
         }
         if includeServiceTier,
-           let serviceTier = runtimeServiceTierForTurn() {
+           let serviceTier = runtimeServiceTierForTurn(threadId: threadId) {
             params["serviceTier"] = .string(serviceTier)
         }
-        if let collaborationModePayload = try buildCollaborationModePayload(for: collaborationMode) {
+        if let collaborationModePayload = try buildCollaborationModePayload(
+            for: collaborationMode,
+            threadId: threadId
+        ) {
             params["collaborationMode"] = collaborationModePayload
         }
         return params
     }
 
     // Encodes collaborationMode while allowing the selected mode to supply built-in instructions.
-    func buildCollaborationModePayload(for mode: CodexCollaborationModeKind?) throws -> JSONValue? {
+    func buildCollaborationModePayload(
+        for mode: CodexCollaborationModeKind?,
+        threadId: String?
+    ) throws -> JSONValue? {
         guard let mode else {
             return nil
         }
@@ -1002,7 +1128,9 @@ extension CodexService {
             "mode": .string(mode.rawValue),
             "settings": .object([
                 "model": .string(resolvedModel),
-                "reasoning_effort": selectedReasoningEffortForSelectedModel().map(JSONValue.string) ?? .null,
+                "reasoning_effort": selectedReasoningEffortForSelectedModel(
+                    threadId: threadId
+                ).map(JSONValue.string) ?? .null,
                 "developer_instructions": .null,
             ]),
         ])
@@ -1050,7 +1178,7 @@ extension CodexService {
             beginAssistantMessage(threadId: threadId, turnId: turnID)
         }
 
-        if let index = threads.firstIndex(where: { $0.id == threadId }) {
+        if let index = threadIndex(for: threadId) {
             threads[index].updatedAt = Date()
             threads[index].syncState = .live
             threads = sortThreads(threads)
@@ -1217,10 +1345,28 @@ extension CodexService {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    // Resolves the currently running turn id from thread/read when local state becomes stale.
+    // Resolves the currently interruptible turn id from thread/read when local state becomes stale.
+    // If the runtime reports "running" without an id yet, surface that instead of falling
+    // back to the latest completed turn and interrupting the wrong run.
     func resolveInFlightTurnID(threadId: String) async throws -> String? {
-        let snapshot = try await readThreadTurnStateSnapshot(threadId: threadId)
-        return snapshot.interruptibleTurnID ?? snapshot.latestTurnID
+        let maxAttempts = 3
+        for attempt in 0..<maxAttempts {
+            let snapshot = try await readThreadTurnStateSnapshot(threadId: threadId)
+            if let interruptibleTurnID = snapshot.interruptibleTurnID {
+                return interruptibleTurnID
+            }
+            if snapshot.hasInterruptibleTurnWithoutID {
+                if attempt < (maxAttempts - 1) {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    continue
+                }
+                throw CodexServiceError.invalidInput(
+                    "The active run has not published an interruptible turn ID yet. Please try again in a moment."
+                )
+            }
+            return nil
+        }
+        return nil
     }
 
     // Parses turn status values from thread/read turn objects.
@@ -1287,38 +1433,84 @@ extension CodexService {
         hasInterruptibleTurnWithoutID: Bool,
         latestTurnID: String?
     ) {
-        let params: JSONValue = .object([
-            "threadId": .string(threadId),
-            "includeTurns": .bool(true),
-        ])
+        let response: RPCMessage
+        do {
+            response = try await sendRequest(
+                method: "thread/read",
+                params: .object([
+                    "threadId": .string(threadId),
+                    "includeTurns": .bool(true),
+                ])
+            )
+        } catch {
+            guard shouldRetryThreadReadTurnSnapshotWithSnakeCase(error) else {
+                throw error
+            }
 
-        let response = try await sendRequest(method: "thread/read", params: params)
+            response = try await sendRequest(
+                method: "thread/read",
+                params: .object([
+                    "thread_id": .string(threadId),
+                    "include_turns": .bool(true),
+                ])
+            )
+        }
+
         guard let threadObject = response.result?.objectValue?["thread"]?.objectValue else {
             return (nil, false, nil)
         }
 
         let turnObjects = threadObject["turns"]?.arrayValue?.compactMap { $0.objectValue } ?? []
-        guard let latestTurnObject = turnObjects.last else {
+        guard !turnObjects.isEmpty else {
             return (nil, false, nil)
         }
 
-        let latestTurnID = normalizedInterruptIdentifier(
-            latestTurnObject["id"]?.stringValue
-                ?? latestTurnObject["turnId"]?.stringValue
-                ?? latestTurnObject["turn_id"]?.stringValue
-        )
-        let latestStatus = normalizedInterruptTurnStatus(from: latestTurnObject)
+        let latestTurnID = turnObjects.reversed().compactMap { turnObject in
+            normalizedInterruptIdentifier(
+                turnObject["id"]?.stringValue
+                    ?? turnObject["turnId"]?.stringValue
+                    ?? turnObject["turn_id"]?.stringValue
+            )
+        }.first
 
-        // Missing status should stay permissive so incomplete payloads do not clear live UI state.
-        guard isInterruptibleTurnStatus(latestStatus) else {
-            return (nil, false, latestTurnID)
+        // Some thread/read payloads can include a newer completed turn after the currently
+        // running one, so scan backwards for the most recent interruptible turn instead of
+        // assuming the array tail is always the active run.
+        var hasInterruptibleTurnWithoutID = false
+        for turnObject in turnObjects.reversed() {
+            let turnStatus = normalizedInterruptTurnStatus(from: turnObject)
+            guard isInterruptibleTurnStatus(turnStatus) else {
+                continue
+            }
+
+            if let interruptibleTurnID = normalizedInterruptIdentifier(
+                turnObject["id"]?.stringValue
+                    ?? turnObject["turnId"]?.stringValue
+                    ?? turnObject["turn_id"]?.stringValue
+            ) {
+                return (interruptibleTurnID, false, latestTurnID)
+            }
+
+            hasInterruptibleTurnWithoutID = true
         }
 
-        if let latestTurnID {
-            return (latestTurnID, false, latestTurnID)
+        return (nil, hasInterruptibleTurnWithoutID, latestTurnID)
+    }
+
+    // Keeps stop recovery compatible with runtimes that only accept snake_case thread/read params.
+    func shouldRetryThreadReadTurnSnapshotWithSnakeCase(_ error: Error) -> Bool {
+        guard let serviceError = error as? CodexServiceError,
+              case .rpcError(let rpcError) = serviceError else {
+            return false
         }
 
-        return (nil, true, latestTurnID)
+        guard rpcError.code == -32600 || rpcError.code == -32602 else {
+            return false
+        }
+
+        let message = rpcError.message.lowercased()
+        let hints = ["threadid", "includeturns", "thread_id", "include_turns", "unknown field", "missing field", "invalid"]
+        return hints.contains { message.contains($0) }
     }
 
     // Retries after refreshing turn id when local activeTurn cache is stale.

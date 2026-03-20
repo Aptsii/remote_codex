@@ -8,11 +8,28 @@ import AVFoundation
 import SwiftUI
 
 struct QRScannerView: View {
+    let onBack: (() -> Void)?
     let onScan: (CodexPairingQRPayload) -> Void
 
     @State private var scannerError: String?
+    @State private var bridgeUpdatePrompt: CodexBridgeUpdatePrompt?
+    @State private var didCopyBridgeUpdateCommand = false
     @State private var hasCameraPermission = false
     @State private var isCheckingPermission = true
+
+    init(
+        initialBridgeUpdatePrompt: CodexBridgeUpdatePrompt? = nil,
+        initialHasCameraPermission: Bool = false,
+        initialIsCheckingPermission: Bool = true,
+        onBack: (() -> Void)? = nil,
+        onScan: @escaping (CodexPairingQRPayload) -> Void
+    ) {
+        self.onBack = onBack
+        self.onScan = onScan
+        _bridgeUpdatePrompt = State(initialValue: initialBridgeUpdatePrompt)
+        _hasCameraPermission = State(initialValue: initialHasCameraPermission)
+        _isCheckingPermission = State(initialValue: initialIsCheckingPermission)
+    }
 
     var body: some View {
         ZStack {
@@ -21,6 +38,8 @@ struct QRScannerView: View {
             if isCheckingPermission {
                 ProgressView()
                     .tint(.white)
+            } else if let bridgeUpdatePrompt {
+                bridgeUpdateView(prompt: bridgeUpdatePrompt)
             } else if hasCameraPermission {
                 QRCameraPreview { code, resetScanLock in
                     handleScanResult(code, resetScanLock: resetScanLock)
@@ -30,6 +49,13 @@ struct QRScannerView: View {
                 scannerOverlay
             } else {
                 cameraPermissionView
+            }
+        }
+        .overlay(alignment: .topLeading) {
+            if let onBack {
+                backButton(action: onBack)
+                    .padding(.leading, 20)
+                    .padding(.top, 12)
             }
         }
         .task {
@@ -43,6 +69,116 @@ struct QRScannerView: View {
         } message: {
             Text(scannerError ?? "Invalid QR code")
         }
+    }
+
+    // Blocks repeated scans when the camera spots a bridge QR from an incompatible npm release.
+    private func bridgeUpdateView(prompt: CodexBridgeUpdatePrompt) -> some View {
+        VStack(alignment: .leading, spacing: 24) {
+            Spacer()
+
+            VStack(alignment: .leading, spacing: 12) {
+                Text(prompt.title)
+                    .font(AppFont.title3(weight: .semibold))
+                    .foregroundStyle(.white)
+
+                Text(prompt.message)
+                    .font(AppFont.body())
+                    .foregroundStyle(.white.opacity(0.82))
+            }
+
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Do these steps on your Mac")
+                    .font(AppFont.caption(weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.7))
+
+                bridgeUpdateStep(number: "1", title: "Update Remodex", detail: prompt.command, showsCopyButton: true)
+                bridgeUpdateStep(number: "2", title: "Start it again", detail: "Run remodex up")
+                bridgeUpdateStep(number: "3", title: "Make a new QR code", detail: "Use the new QR shown in the terminal")
+                bridgeUpdateStep(number: "4", title: "Come back here", detail: "Then scan the new QR code from the iPhone")
+            }
+
+            Button("I Updated It") {
+                bridgeUpdatePrompt = nil
+                didCopyBridgeUpdateCommand = false
+            }
+            .font(AppFont.body(weight: .semibold))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+            .foregroundStyle(.black)
+            .background(.white, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .buttonStyle(.plain)
+
+            Spacer()
+        }
+        .padding(.horizontal, 24)
+    }
+
+    private func bridgeUpdateStep(
+        number: String,
+        title: String,
+        detail: String,
+        showsCopyButton: Bool = false
+    ) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text(number)
+                .font(AppFont.caption2(weight: .bold))
+                .foregroundStyle(.black)
+                .frame(width: 20, height: 20)
+                .background(.white, in: Circle())
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text(title)
+                    .font(AppFont.subheadline(weight: .semibold))
+                    .foregroundStyle(.white)
+
+                Text(detail)
+                    .font(showsCopyButton ? AppFont.mono(.caption) : AppFont.caption())
+                    .foregroundStyle(.white.opacity(0.82))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Color.white.opacity(0.08))
+                    )
+
+                if showsCopyButton {
+                    Button(didCopyBridgeUpdateCommand ? "Copied" : "Copy Command") {
+                        UIPasteboard.general.string = detail
+                        HapticFeedback.shared.triggerImpactFeedback(style: .light)
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            didCopyBridgeUpdateCommand = true
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                didCopyBridgeUpdateCommand = false
+                            }
+                        }
+                    }
+                    .font(AppFont.caption(weight: .semibold))
+                    .foregroundStyle(.white)
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    // Keeps the first-run scanner escapable without turning reconnect recovery into onboarding.
+    private func backButton(action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: "chevron.left")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(Color.white.opacity(0.12), in: Circle())
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Back to onboarding")
     }
 
     private var scannerOverlay: some View {
@@ -100,46 +236,36 @@ struct QRScannerView: View {
     }
 
     private func handleScanResult(_ code: String, resetScanLock: @escaping () -> Void) {
-        guard let data = code.data(using: .utf8) else {
-            scannerError = "QR code contains invalid text encoding."
+        switch validatePairingQRCode(code) {
+        case .success(let payload):
+            onScan(payload)
+        case .scanError(let message):
+            scannerError = message
             resetScanLock()
-            return
-        }
-
-        let decoder = JSONDecoder()
-        guard let payload = try? decoder.decode(CodexPairingQRPayload.self, from: data) else {
-            scannerError = "Not a valid secure pairing code. Make sure you're scanning a QR from the latest Remodex bridge."
+        case .bridgeUpdateRequired(let prompt):
+            didCopyBridgeUpdateCommand = false
+            bridgeUpdatePrompt = prompt
             resetScanLock()
-            return
         }
-
-        guard payload.v == codexPairingQRVersion else {
-            scannerError = "This QR code uses an unsupported pairing format. Update the iPhone app or the Mac bridge and try again."
-            resetScanLock()
-            return
-        }
-
-        guard !payload.relay.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            scannerError = "QR code is missing the relay URL. Re-generate the code from the bridge."
-            resetScanLock()
-            return
-        }
-
-        guard !payload.sessionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            scannerError = "QR code is missing the session ID. Re-generate the code from the bridge."
-            resetScanLock()
-            return
-        }
-
-        let expiryDate = Date(timeIntervalSince1970: TimeInterval(payload.expiresAt) / 1000)
-        if expiryDate.addingTimeInterval(codexSecureClockSkewToleranceSeconds) < Date() {
-            scannerError = "This pairing QR code has expired. Generate a new one from the Mac bridge."
-            resetScanLock()
-            return
-        }
-
-        onScan(payload)
     }
+}
+
+private extension CodexBridgeUpdatePrompt {
+    static let previewScannerMismatch = CodexBridgeUpdatePrompt(
+        title: "Update Remodex on your Mac before scanning",
+        message: "This QR code was generated by a different Remodex npm version. Update the package on your Mac to the latest release before scanning a new QR code.",
+        command: "npm install -g remodex@latest"
+    )
+}
+
+// MARK: - Preview
+
+#Preview("Bridge Update Required") {
+    QRScannerView(
+        initialBridgeUpdatePrompt: .previewScannerMismatch,
+        initialIsCheckingPermission: false,
+        onBack: {}
+    ) { _ in }
 }
 
 // MARK: - Camera Preview UIViewRepresentable
@@ -158,15 +284,93 @@ private struct QRCameraPreview: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: QRCameraUIView, context: Context) {}
+
+    // Tears down the camera before UIKit deallocates the preview layer.
+    static func dismantleUIView(_ uiView: QRCameraUIView, coordinator: ()) {
+        uiView.stopCamera()
+    }
 }
 
+// Serializes camera session handoff so a fast reopen cannot start before the previous stop completes.
+private final class QRCameraLifecycleCoordinator {
+    static let shared = QRCameraLifecycleCoordinator()
+    private typealias DeferredStart = () -> Void
+
+    private let queue = DispatchQueue(label: "com.phodex.qr-camera.lifecycle")
+    private let lock = NSLock()
+    private var isStopInFlight = false
+    private var deferredStarts: [DeferredStart] = []
+
+    // Starts immediately unless a previous stop still owns the camera handoff.
+    func start(session: AVCaptureSession, canStart: @escaping () -> Bool) {
+        let startWork: DeferredStart = { [queue] in
+            queue.async {
+                guard canStart(), !session.isRunning else {
+                    return
+                }
+                session.startRunning()
+            }
+        }
+
+        guard !deferStartIfNeeded(startWork) else {
+            return
+        }
+
+        startWork()
+    }
+
+    // Holds new starts until stopRunning completes, then replays any deferred opens.
+    func stop(session: AVCaptureSession) {
+        lock.lock()
+        isStopInFlight = true
+        lock.unlock()
+
+        queue.async { [weak self] in
+            guard session.isRunning else {
+                self?.finishStopAndReplayDeferredStarts()
+                return
+            }
+
+            session.stopRunning()
+            self?.finishStopAndReplayDeferredStarts()
+        }
+    }
+
+    // Reopens queued scanners only after the previous session fully releases the camera.
+    private func finishStopAndReplayDeferredStarts() {
+        lock.lock()
+        let startsToReplay = deferredStarts
+        deferredStarts.removeAll()
+        isStopInFlight = false
+        lock.unlock()
+
+        startsToReplay.forEach { start in
+            start()
+        }
+    }
+
+    // Converts overlapping reopen attempts into deferred starts while teardown is active.
+    private func deferStartIfNeeded(_ startWork: @escaping DeferredStart) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard isStopInFlight else {
+            return false
+        }
+
+        deferredStarts.append(startWork)
+        return true
+    }
+}
+
+// Owns the AVFoundation session lifecycle for the SwiftUI scanner host view.
 private class QRCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate {
     var onScan: ((String) -> Void)?
 
     private let captureSession = AVCaptureSession()
-    private let sessionQueue = DispatchQueue(label: "com.phodex.qr-camera")
     private var previewLayer: AVCaptureVideoPreviewLayer?
     private var hasScanned = false
+    private var isStoppingCamera = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -183,6 +387,7 @@ private class QRCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate {
         previewLayer?.frame = bounds
     }
 
+    // Configures the metadata session once and starts it off the main thread.
     private func setupCamera() {
         guard let device = AVCaptureDevice.default(for: .video),
               let input = try? AVCaptureDeviceInput(device: device) else {
@@ -205,8 +410,11 @@ private class QRCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate {
         self.layer.addSublayer(layer)
         previewLayer = layer
 
-        sessionQueue.async { [weak self] in
-            self?.captureSession.startRunning()
+        QRCameraLifecycleCoordinator.shared.start(session: captureSession) { [weak self] in
+            guard let self else {
+                return false
+            }
+            return !self.isStoppingCamera
         }
     }
 
@@ -231,10 +439,102 @@ private class QRCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate {
         hasScanned = false
     }
 
-    deinit {
-        let session = captureSession
-        sessionQueue.async {
-            session.stopRunning()
+    // Detaches the preview layer first so AVFoundation teardown stays serialized.
+    func stopCamera() {
+        guard !isStoppingCamera else {
+            return
         }
+
+        isStoppingCamera = true
+        onScan = nil
+
+        let layerToRemove = previewLayer
+        previewLayer = nil
+        layerToRemove?.session = nil
+        layerToRemove?.removeFromSuperlayer()
+
+        QRCameraLifecycleCoordinator.shared.stop(session: captureSession)
     }
+
+    deinit {
+        stopCamera()
+    }
+}
+
+enum QRScannerPairingValidationResult {
+    case success(CodexPairingQRPayload)
+    case scanError(String)
+    case bridgeUpdateRequired(CodexBridgeUpdatePrompt)
+}
+
+private let qrScannerBridgeUpdateCommand = "npm install -g remodex@latest"
+
+private func validatePairingQRCode(
+    _ code: String,
+    now: Date = Date()
+) -> QRScannerPairingValidationResult {
+    guard let data = code.data(using: .utf8) else {
+        return .scanError("QR code contains invalid text encoding.")
+    }
+
+    let decoder = JSONDecoder()
+    if let payload = try? decoder.decode(CodexPairingQRPayload.self, from: data) {
+        guard payload.v == codexPairingQRVersion else {
+            return .bridgeUpdateRequired(
+                makeScannerBridgeUpdatePrompt(
+                    message: "This QR code was generated by a different Remodex npm version. Update the package on your Mac to the latest release before scanning a new QR code."
+                )
+            )
+        }
+
+        guard !payload.relay.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .scanError("QR code is missing the relay URL. Re-generate the code from the bridge.")
+        }
+
+        guard !payload.sessionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .scanError("QR code is missing the session ID. Re-generate the code from the bridge.")
+        }
+
+        let expiryDate = Date(timeIntervalSince1970: TimeInterval(payload.expiresAt) / 1000)
+        guard expiryDate.addingTimeInterval(codexSecureClockSkewToleranceSeconds) >= now else {
+            return .scanError("This pairing QR code has expired. Generate a new one from the Mac bridge.")
+        }
+
+        return .success(payload)
+    }
+
+    if looksLikeRemodexPairingPayload(data) {
+        return .bridgeUpdateRequired(
+            makeScannerBridgeUpdatePrompt(
+                message: "This QR code looks like it came from an older Remodex bridge. Update the npm package on your Mac to the latest release before scanning a new QR code."
+            )
+        )
+    }
+
+    return .scanError("Not a valid secure pairing code. Make sure you're scanning a QR from the latest Remodex bridge.")
+}
+
+private func looksLikeRemodexPairingPayload(_ data: Data) -> Bool {
+    guard let jsonObject = try? JSONSerialization.jsonObject(with: data),
+          let object = jsonObject as? [String: Any] else {
+        return false
+    }
+
+    let pairingKeys: Set<String> = [
+        "relay",
+        "sessionId",
+        "macDeviceId",
+        "macIdentityPublicKey",
+        "expiresAt",
+        "v",
+    ]
+    return !pairingKeys.isDisjoint(with: object.keys)
+}
+
+private func makeScannerBridgeUpdatePrompt(message: String) -> CodexBridgeUpdatePrompt {
+    CodexBridgeUpdatePrompt(
+        title: "Update Remodex on your Mac before scanning",
+        message: message,
+        command: qrScannerBridgeUpdateCommand
+    )
 }

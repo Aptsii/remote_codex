@@ -18,15 +18,25 @@ function wait(ms) {
 }
 
 test("readBridgeConfig keeps safe defaults and explicit overrides", () => {
-  const macConfig = readBridgeConfig({ env: {}, platform: "darwin" });
+  const networkInterfaces = () => ({
+    lo0: [
+      { family: "IPv4", address: "127.0.0.1", internal: true },
+    ],
+    en0: [
+      { family: "IPv4", address: "192.168.0.25", internal: false },
+    ],
+  });
+  const macConfig = readBridgeConfig({ env: {}, platform: "darwin", networkInterfaces });
   const macEndpointConfig = readBridgeConfig({
     env: { REMODEX_CODEX_ENDPOINT: "ws://localhost:8080" },
     platform: "darwin",
+    networkInterfaces,
   });
-  const linuxConfig = readBridgeConfig({ env: {}, platform: "linux" });
+  const linuxConfig = readBridgeConfig({ env: {}, platform: "linux", networkInterfaces });
   const linuxCommandConfig = readBridgeConfig({
     env: { REMODEX_REFRESH_COMMAND: "echo refresh" },
     platform: "linux",
+    networkInterfaces,
   });
   const explicitOnConfig = readBridgeConfig({
     env: {
@@ -34,6 +44,7 @@ test("readBridgeConfig keeps safe defaults and explicit overrides", () => {
       REMODEX_REFRESH_ENABLED: "true",
     },
     platform: "darwin",
+    networkInterfaces,
   });
   const explicitOffConfig = readBridgeConfig({
     env: {
@@ -41,14 +52,44 @@ test("readBridgeConfig keeps safe defaults and explicit overrides", () => {
       REMODEX_REFRESH_ENABLED: "false",
     },
     platform: "darwin",
+    networkInterfaces,
+  });
+  const explicitRelayConfig = readBridgeConfig({
+    env: {
+      REMODEX_RELAY: "wss://relay.example/relay",
+    },
+    platform: "darwin",
+    networkInterfaces,
+  });
+  const explicitHostConfig = readBridgeConfig({
+    env: {
+      REMODEX_RELAY_HOST: "100.64.0.8",
+      REMODEX_RELAY_PORT: "9999",
+    },
+    platform: "darwin",
+    networkInterfaces,
+  });
+  const relaunchRefreshConfig = readBridgeConfig({
+    env: {
+      REMODEX_REFRESH_MODE: "relaunch",
+    },
+    platform: "darwin",
+    networkInterfaces,
   });
 
+  assert.equal(macConfig.managedRelay, true);
+  assert.equal(macConfig.relayUrl, "ws://192.168.0.25:8787/relay");
   assert.equal(macConfig.refreshEnabled, false);
+  assert.equal(macConfig.refreshMode, "bounce");
   assert.equal(macEndpointConfig.refreshEnabled, false);
   assert.equal(linuxConfig.refreshEnabled, false);
   assert.equal(linuxCommandConfig.refreshEnabled, false);
   assert.equal(explicitOnConfig.refreshEnabled, true);
   assert.equal(explicitOffConfig.refreshEnabled, false);
+  assert.equal(explicitRelayConfig.managedRelay, false);
+  assert.equal(explicitRelayConfig.relayUrl, "wss://relay.example/relay");
+  assert.equal(explicitHostConfig.relayUrl, "ws://100.64.0.8:9999/relay");
+  assert.equal(relaunchRefreshConfig.refreshMode, "relaunch");
 });
 
 test("thread/start falls back once to the new-thread route when thread id is still unknown", async () => {
@@ -177,6 +218,71 @@ test("rollout growth refreshes are throttled during long runs", async () => {
   assert.deepEqual(refreshCalls, ["codex://threads/thread-456"]);
 });
 
+test("relaunch mode only uses a full app restart for discrete phone/completion refreshes", async () => {
+  const refreshCalls = [];
+  let watcherHooks = null;
+
+  const refresher = new CodexDesktopRefresher({
+    enabled: true,
+    debounceMs: 0,
+    refreshMode: "relaunch",
+    refreshExecutor: async (targetUrl, mode) => {
+      refreshCalls.push({ targetUrl, mode });
+    },
+    watchThreadRolloutFactory: (hooks) => {
+      watcherHooks = hooks;
+      return { stop() {} };
+    },
+  });
+
+  refresher.handleInbound(JSON.stringify({
+    method: "turn/start",
+    params: {
+      threadId: "thread-hard-refresh",
+    },
+  }));
+  await wait(10);
+
+  assert.deepEqual(refreshCalls, [{
+    targetUrl: "codex://threads/thread-hard-refresh",
+    mode: "relaunch",
+  }]);
+
+  refreshCalls.length = 0;
+  watcherHooks.onEvent({
+    reason: "growth",
+    threadId: "thread-hard-refresh",
+    size: 10,
+  });
+  await wait(10);
+
+  assert.deepEqual(refreshCalls, [{
+    targetUrl: "codex://threads/thread-hard-refresh",
+    mode: "bounce",
+  }]);
+});
+
+test("manual desktop refresh uses relaunch even when automatic refresh stays disabled", async () => {
+  const refreshCalls = [];
+  const refresher = new CodexDesktopRefresher({
+    enabled: false,
+    refreshExecutor: async (targetUrl, mode) => {
+      refreshCalls.push({ targetUrl, mode });
+    },
+  });
+
+  const result = await refresher.runManualRefresh({ threadId: "thread-manual-refresh" });
+
+  assert.deepEqual(refreshCalls, [{
+    targetUrl: "codex://threads/thread-manual-refresh",
+    mode: "relaunch",
+  }]);
+  assert.deepEqual(result, {
+    threadId: "thread-manual-refresh",
+    targetUrl: "codex://threads/thread-manual-refresh",
+    mode: "relaunch",
+  });
+});
 test("turn/completed bypasses duplicate-target dedupe and still stops the watcher", async () => {
   const refreshCalls = [];
   let stopCount = 0;

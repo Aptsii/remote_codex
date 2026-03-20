@@ -1,8 +1,8 @@
 // FILE: TurnComposerInputTextView.swift
-// Purpose: UIViewRepresentable wrapper for the composer text input with paste-image interception.
+// Purpose: UIViewRepresentable wrapper for the composer text input and paste-image interception.
 // Layer: View Component
 // Exports: TurnComposerInputTextView, TurnComposerPasteInterceptingTextView
-// Depends on: SwiftUI, UIKit
+// Depends on: SwiftUI, UIKit, TurnComposerRuntimeMenuBuilder
 
 import SwiftUI
 import UIKit
@@ -12,6 +12,8 @@ struct TurnComposerInputTextView: UIViewRepresentable {
     @Binding var isFocused: Bool
     let isEditable: Bool
     @Binding var dynamicHeight: CGFloat
+    let runtimeState: TurnComposerRuntimeState?
+    let runtimeActions: TurnComposerRuntimeActions
     let onPasteImageData: ([Data]) -> Void
 
     private let minVisibleLines: CGFloat = 1
@@ -25,12 +27,16 @@ struct TurnComposerInputTextView: UIViewRepresentable {
         textView.textColor = UIColor.label
         textView.textContainerInset = .zero
         textView.textContainer.lineFragmentPadding = 0
+        textView.textContainer.widthTracksTextView = true
         textView.autocorrectionType = .default
         textView.autocapitalizationType = .sentences
         textView.isScrollEnabled = true
         textView.showsVerticalScrollIndicator = false
         textView.keyboardDismissMode = .none
         textView.onPasteImageData = onPasteImageData
+        textView.runtimeState = runtimeState
+        textView.runtimeActions = runtimeActions
+        textView.setContentHuggingPriority(.defaultLow, for: .horizontal)
         textView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         textView.accessibilityIdentifier = "turn.composer.input"
         context.coordinator.syncFocusIfNeeded(
@@ -56,7 +62,11 @@ struct TurnComposerInputTextView: UIViewRepresentable {
         uiView.isEditable = isEditable
         uiView.isSelectable = true
         uiView.font = composerUIFont()
+        uiView.textContainer.widthTracksTextView = true
         uiView.onPasteImageData = onPasteImageData
+        uiView.runtimeState = runtimeState
+        uiView.runtimeActions = runtimeActions
+        uiView.setContentHuggingPriority(.defaultLow, for: .horizontal)
         context.coordinator.syncFocusIfNeeded(
             for: uiView,
             shouldBeFocused: isFocused,
@@ -207,6 +217,8 @@ struct TurnComposerInputTextView: UIViewRepresentable {
 // Only used by TurnComposerInputTextView in this file.
 final class TurnComposerPasteInterceptingTextView: UITextView {
     var onPasteImageData: (([Data]) -> Void)?
+    var runtimeState: TurnComposerRuntimeState?
+    var runtimeActions: TurnComposerRuntimeActions?
 
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         super.init(frame: frame, textContainer: textContainer)
@@ -220,6 +232,24 @@ final class TurnComposerPasteInterceptingTextView: UITextView {
     // Without this, SwiftUI uses the full text width as the ideal size.
     override var intrinsicContentSize: CGSize {
         CGSize(width: UIView.noIntrinsicMetric, height: super.intrinsicContentSize.height)
+    }
+
+    // Adds the shared runtime controls directly into the text edit menu.
+    override func buildMenu(with builder: any UIMenuBuilder) {
+        super.buildMenu(with: builder)
+
+        guard let runtimeState, let runtimeActions else {
+            return
+        }
+
+        guard let runtimeMenu = TurnComposerRuntimeMenuBuilder(
+            runtimeState: runtimeState,
+            runtimeActions: runtimeActions
+        ).makeRuntimeMenu() else {
+            return
+        }
+
+        builder.insertChild(runtimeMenu, atEndOfMenu: .standardEdit)
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {

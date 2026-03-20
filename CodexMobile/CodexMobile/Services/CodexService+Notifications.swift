@@ -170,6 +170,44 @@ extension CodexService {
             }
         }
     }
+
+    // Retries deferred notification deep-links after reconnect or thread-list refresh.
+    @discardableResult
+    func routePendingNotificationOpenIfPossible(refreshIfNeeded: Bool = true) async -> Bool {
+        guard let pendingThreadId = pendingNotificationOpenThreadID?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !pendingThreadId.isEmpty else {
+            return false
+        }
+
+        if threads.contains(where: { $0.id == pendingThreadId }) {
+            if await prepareThreadForDisplay(threadId: pendingThreadId) {
+                if pendingNotificationOpenThreadID == pendingThreadId {
+                    pendingNotificationOpenThreadID = nil
+                }
+                return true
+            }
+            return false
+        }
+
+        guard refreshIfNeeded else {
+            return false
+        }
+
+        await refreshThreadsForNotificationRouting()
+        guard threads.contains(where: { $0.id == pendingThreadId }) else {
+            return false
+        }
+
+        if await prepareThreadForDisplay(threadId: pendingThreadId) {
+            if pendingNotificationOpenThreadID == pendingThreadId {
+                pendingNotificationOpenThreadID = nil
+            }
+            return true
+        }
+
+        return false
+    }
 }
 
 private extension CodexService {

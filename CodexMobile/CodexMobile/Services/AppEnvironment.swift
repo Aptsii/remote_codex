@@ -7,14 +7,19 @@
 import Foundation
 
 enum AppEnvironment {
-    private static let defaultRelayURLInfoPlistKey = "PHODEX_DEFAULT_RELAY_URL"
+    private static let defaultRelayURLInfoPlistKeys = [
+        "REMODEX_DEFAULT_RELAY_URL",
+        "PHODEX_DEFAULT_RELAY_URL"
+    ]
 
-    // Keeps a working default relay when no explicit value is configured.
-    static let defaultRelayURLString = "wss://api.phodex.app/relay"
+    // Keep a local-only fallback for simulator/testing flows when no QR pairing is available.
+    static let defaultRelayURLString = "ws://127.0.0.1:8787/relay"
 
     static var relayBaseURL: String {
-        if let infoURL = resolvedString(forInfoPlistKey: defaultRelayURLInfoPlistKey) {
-            return infoURL
+        for key in defaultRelayURLInfoPlistKeys {
+            if let infoURL = resolvedString(forInfoPlistKey: key) {
+                return infoURL
+            }
         }
         return defaultRelayURLString
     }
